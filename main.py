@@ -1,6 +1,6 @@
 """
 SCRIPTBEES ASSISTANT - HEAVY VERSION (FAISS + TORCH + SENTENCE-TRANSFORMERS)
-Fully Render-Compatible — Fixes OpenAI Client.proxy error
+Render-compatible — removed invalid httpx 'proxies' kw
 """
 
 import os
@@ -12,17 +12,18 @@ from typing import List
 from pathlib import Path
 
 # ======================================================================
-# REMOVE ALL PROXY ENV VARIABLES (Render injects them → OpenAI crashes)
+# REMOVE PROXY ENV VARIABLES (Render may inject these -> avoid proxy use)
 # ======================================================================
 os.environ.pop("HTTP_PROXY", None)
 os.environ.pop("HTTPS_PROXY", None)
+os.environ.pop("http_proxy", None)
+os.environ.pop("https_proxy", None)
 
 import httpx
 from openai import OpenAI
 
-# -> Create a proxy-free HTTP client for OpenAI
+# -> Create a safe httpx client WITHOUT passing 'proxies' (some httpx builds don't accept it)
 safe_http_client = httpx.Client(
-    proxies=None,
     timeout=30,
     verify=True,
 )
@@ -115,7 +116,7 @@ def verify_api_key(req: Request, key: str = Security(api_key_header)):
 
     if not incoming:
         auth = req.headers.get("authorization", "")
-        if auth.lower().startswith("bearer "):
+        if auth and auth.lower().startswith("bearer "):
             incoming = auth.split(" ", 1)[1]
 
     if incoming != API_KEY:
@@ -151,6 +152,7 @@ async def startup():
 
             self.model = SentenceTransformer(MODEL_NAME)
 
+            # load faiss index and metadata
             self.index = faiss.read_index(INDEX_PATH)
 
             with open(META_PATH, "r") as f:
@@ -161,7 +163,11 @@ async def startup():
 
             self.pages = {p["id"]: p for p in pages}
 
-            logger.info(f"✓ Loaded {self.index.ntotal} documents")
+            try:
+                total = int(self.index.ntotal)
+            except Exception:
+                total = len(self.meta)
+            logger.info(f"✓ Loaded {total} documents")
 
         def retrieve(self, q):
             vec = self.model.encode([q], normalize_embeddings=True).astype("float32")
@@ -173,28 +179,25 @@ async def startup():
                     continue
                 meta = self.meta[idx]
                 page = self.pages[meta["id"]]
-
                 results.append({
                     "score": float(s),
-                    "url": meta["url"],
-                    "title": meta["title"],
-                    "text": page["text"][:500]
+                    "url": meta.get("url", ""),
+                    "title": meta.get("title", ""),
+                    "text": page.get("text", "")[:500]
                 })
             return results
 
     # ------------------ GENERATOR (OpenAI) ----------------------
     class LLMGenerator:
         def __init__(self):
-            logger.info("🤖 Using GPT-4o-mini (safe, proxy-free)")
-
+            logger.info("🤖 Using OpenAI (gpt-4o-mini) via OpenAI SDK (safe http client)")
             self.client = OpenAI(
                 api_key=OPENAI_API_KEY,
-                http_client=safe_http_client    # <--- IMPORTANT FIX
+                http_client=safe_http_client
             )
 
         def generate(self, question, docs):
             context = docs[0]["text"]
-
             prompt = f"""
 Use ONLY this context to answer:
 
@@ -204,16 +207,13 @@ Question: {question}
 
 Short and accurate answer:
 """
-
             resp = self.client.chat.completions.create(
                 model="gpt-4o-mini",
                 messages=[{"role": "user", "content": prompt}],
                 max_tokens=MAX_TOKENS,
                 temperature=TEMPERATURE
             )
-
             answer = resp.choices[0].message.content.strip()
-
             return answer + f"\n\n[Source: {docs[0]['url']}]"
 
     retriever = Retriever()
