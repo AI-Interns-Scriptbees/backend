@@ -1,0 +1,12 @@
+[
+  {
+    "id": 0,
+    "url": "https://example.com/page1",
+    "title": "Sample Page 1"
+  },
+  {
+    "id": 1,
+    "url": "https://example.com/page2",
+    "title": "Sample Page 2"
+  }
+]

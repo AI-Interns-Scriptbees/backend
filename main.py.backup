@@ -1,0 +1,344 @@
+"""
+RAG Chatbot Backend - FastAPI
+Fixed main.py that reliably loads .env for both "python main.py" and "uvicorn" runs.
+- Walks parent folders to find .env
+- Loads dotenv before any env usage
+- Logs where .env was loaded from
+- Keeps heavy ML imports inside startup_event
+- Retains API key verification debug logging
+"""
+
+import os
+import json
+import logging
+from typing import List, Optional
+from pathlib import Path
+
+# dotenv must be loaded as early as possible so subsequent code (and uvicorn) sees the vars
+from dotenv import load_dotenv
+
+# =========================
+# Robust .env loader (walks up until filesystem root)
+# =========================
+
+def find_env_file(start_path: Optional[Path] = None, filename: str = ".env", max_levels: int = 20) -> Optional[Path]:
+    """Search parent folders for a .env file, starting from start_path (defaults to this file's folder)."""
+    try:
+        if start_path is None:
+            start_path = Path(__file__).resolve().parent
+    except Exception:
+        # Fallback if __file__ is not available (very rare)
+        start_path = Path.cwd()
+
+    cur = start_path
+    levels = 0
+    while True:
+        candidate = cur / filename
+        if candidate.exists():
+            return candidate
+        if cur.anchor == cur.as_posix() or levels >= max_levels:
+            return None
+        cur = cur.parent
+        levels += 1
+
+
+# attempt to find .env and load it
+_env_path = find_env_file()
+if _env_path:
+    load_dotenv(dotenv_path=_env_path, override=False)
+    loaded_from = str(_env_path)
+else:
+    # fallback: try default load (will look in CWD)
+    load_dotenv(override=False)
+    loaded_from = "none (no .env found - relied on environment variables or CWD)"
+
+# ===== Logging setup =====
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+logger.info(f"dotenv loaded from: {loaded_from}")
+
+# quick debug print for one var (remove in prod)
+logger.info(f"DEBUG RAG_API_KEY present? {'yes' if os.getenv('RAG_API_KEY') else 'no'}")
+
+# ==========================================
+# Configuration from environment
+# ==========================================
+API_KEY = os.getenv("RAG_API_KEY", "change-me-in-production")
+if API_KEY == "change-me-in-production":
+    logger.warning("RAG_API_KEY not set; using placeholder value. Set RAG_API_KEY in your .env")
+
+CONTENT_DIR = os.getenv("CONTENT_DIR", "content")
+MODEL_NAME = os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
+LLM_MODEL = os.getenv("LLM_MODEL", "orca-mini-3b-gguf2-q4_0.gguf")
+
+INDEX_PATH = os.path.join(CONTENT_DIR, "pages.faiss")
+PAGES_PATH = os.path.join(CONTENT_DIR, "pages.json")
+META_PATH = os.path.join(CONTENT_DIR, "pages_meta.json")
+
+TOP_K = int(os.getenv("TOP_K", "3"))
+MAX_TOKENS = int(os.getenv("MAX_TOKENS", "300"))
+TEMPERATURE = float(os.getenv("TEMPERATURE", "0.7"))
+
+# ==========================================
+# FastAPI and security imports
+# ==========================================
+from fastapi import FastAPI, HTTPException, Depends, Security, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import APIKeyHeader
+from pydantic import BaseModel, Field
+from fastapi.responses import JSONResponse
+
+# ==========================================
+# MODELS (Pydantic)
+# ==========================================
+class AskRequest(BaseModel):
+    question: str = Field(..., min_length=1, max_length=500, description="User question")
+
+
+class Source(BaseModel):
+    url: str
+    title: str
+    score: float
+
+
+class AskResponse(BaseModel):
+    answer: str
+    sources: List[str]
+    retrieved: Optional[List[Source]] = None
+
+
+class ErrorResponse(BaseModel):
+    error: str
+    detail: Optional[str] = None
+
+# ==========================================
+# SECURITY
+# ==========================================
+api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+
+
+def verify_api_key(request: Request, api_key: str = Security(api_key_header)):
+    logger.info(f"DEBUG raw api_key repr: {repr(api_key)} length={len(api_key or '')}")
+
+    incoming = (api_key or "").strip()
+
+    # fallback to Authorization: Bearer <token>
+    if not incoming:
+        auth = request.headers.get("authorization", "")
+        logger.info(f"DEBUG authorization header repr: {repr(auth)}")
+        if auth and auth.lower().startswith("bearer "):
+            incoming = auth.split(" ", 1)[1].strip()
+
+    logger.info(f"DEBUG normalized incoming repr: {repr(incoming)} length={len(incoming or '')}")
+
+    if not incoming:
+        logger.warning("Missing API key in request")
+        raise HTTPException(status_code=403, detail="Missing API key")
+
+    # constant-time compare might be preferable for production; this is fine for dev
+    if incoming != API_KEY:
+        logger.warning("Invalid API key attempt (incoming != server-side API_KEY)")
+        logger.info(f"DEBUG server API_KEY repr: {repr(API_KEY)} length={len(API_KEY or '')}")
+        raise HTTPException(status_code=403, detail="Invalid API key")
+
+    return incoming
+
+
+# ==========================================
+# We'll import heavy ML libs inside startup_event to ensure env is loaded and to delay heavy work
+# ==========================================
+# placeholders for global instances
+retriever = None
+generator = None
+
+# ==========================================
+# FastAPI App
+# ==========================================
+app = FastAPI(
+    title="RAG Chatbot API",
+    description="Retrieval-Augmented Generation chatbot for website Q&A",
+    version="1.0.0"
+)
+
+# CORS
+cors_origins = os.getenv("CORS_ORIGINS", "*")
+allow_origins = [o for o in [s.strip() for s in cors_origins.split(",")] if o]
+if not allow_origins:
+    allow_origins = ["*"]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=allow_origins,
+    allow_credentials=True,
+    allow_methods=["POST", "GET", "OPTIONS"],
+    allow_headers=["*"]
+)
+
+# ==========================================
+# RETRIEVER & GENERATOR (initialized at startup)
+# ==========================================
+def _ensure_files_exist():
+    if not os.path.exists(INDEX_PATH):
+        raise FileNotFoundError(f"Index not found: {INDEX_PATH}")
+    if not os.path.exists(PAGES_PATH):
+        raise FileNotFoundError(f"Pages not found: {PAGES_PATH}")
+    if not os.path.exists(META_PATH):
+        raise FileNotFoundError(f"Pages meta not found: {META_PATH}")
+
+
+@app.on_event("startup")
+async def startup_event():
+    """Initialize models on startup (after dotenv is loaded)."""
+    global retriever, generator
+    logger.info("🚀 Starting RAG Chatbot Backend (startup event)...")
+    try:
+        # check files but don't fail app startup early if models are optional in your flow
+        _ensure_files_exist()
+
+        # import heavy deps here so they use loaded env and so server starts faster for health checks
+        import faiss
+        from sentence_transformers import SentenceTransformer
+        from gpt4all import GPT4All
+
+        class VectorRetriever:
+            """FAISS-based vector retrieval"""
+            def __init__(self, index_path: str, pages_path: str, meta_path: str, model_name: str):
+                logger.info("Loading vector retriever...")
+                self.model = SentenceTransformer(model_name)
+                self.index = faiss.read_index(index_path)
+                with open(meta_path, 'r') as f:
+                    self.metadata = json.load(f)
+                with open(pages_path, 'r') as f:
+                    pages = json.load(f)
+                    self.pages_dict = {p['id']: p for p in pages}
+                logger.info(f"✓ Loaded {self.index.ntotal} documents")
+
+            def retrieve(self, query: str, top_k: int = 3):
+                query_vector = self.model.encode([query], convert_to_numpy=True, normalize_embeddings=True).astype('float32')
+                scores, indices = self.index.search(query_vector, top_k)
+                results = []
+                for score, idx in zip(scores[0], indices[0]):
+                    if idx == -1:
+                        continue
+                    meta = self.metadata[idx]
+                    page = self.pages_dict.get(meta['id'])
+                    if page:
+                        results.append({
+                            'id': meta['id'],
+                            'url': meta['url'],
+                            'title': meta['title'],
+                            'text': page['text'],
+                            'score': float(score)
+                        })
+                return results
+
+        class LLMGenerator:
+            """GPT4All-based answer generation"""
+            def __init__(self, model_name: str):
+                logger.info(f"Loading LLM: {model_name}")
+                self.llm = GPT4All(model_name)
+                logger.info("✓ LLM loaded")
+
+            def generate(self, query: str, context_docs: List[dict], max_tokens: int = 300, temperature: float = 0.7) -> str:
+                context_parts = []
+                for i, doc in enumerate(context_docs[:3], 1):
+                    text = doc['text'][:800]
+                    context_parts.append(f"[Source {i}: {doc['url']}]\nTitle: {doc['title']}\nContent: {text}\n")
+                context = "\n".join(context_parts)
+                prompt = f"""You are a helpful assistant that answers questions based on provided context.
+
+Context from website:
+{context}
+
+Question: {query}
+
+Instructions:
+- Answer concisely based ONLY on the context above
+- Cite sources using [Source 1], [Source 2], etc.
+- If the answer is not in the context, say "I don't have enough information to answer that"
+- Be natural and conversational
+
+Answer:"""
+                # Use chat_session context if GPT4All supports it; otherwise use generate directly
+                try:
+                    with self.llm.chat_session():
+                        answer = self.llm.generate(prompt, max_tokens=max_tokens, temp=temperature)
+                except AttributeError:
+                    answer = self.llm.generate(prompt, max_tokens=max_tokens, temp=temperature)
+                return answer.strip()
+
+        # instantiate global objects
+        retriever = VectorRetriever(INDEX_PATH, PAGES_PATH, META_PATH, MODEL_NAME)
+        generator = LLMGenerator(LLM_MODEL)
+
+        logger.info("✅ Backend ready!")
+
+    except Exception as e:
+        logger.error(f"❌ Startup failed: {e}", exc_info=True)
+        # re-raise so container/orchestration sees failure
+        raise
+
+# ==========================================
+# Endpoints
+# ==========================================
+@app.get("/")
+async def root():
+    return {"status": "healthy", "service": "RAG Chatbot API", "version": "1.0.0"}
+
+
+@app.get("/health")
+async def health():
+    return {
+        "status": "healthy",
+        "retriever_loaded": retriever is not None,
+        "generator_loaded": generator is not None,
+        "num_documents": getattr(getattr(retriever, 'index', None), 'ntotal', 0)
+    }
+
+
+@app.post("/api/ask", response_model=AskResponse)
+async def ask(request: AskRequest, api_key: str = Depends(verify_api_key)):
+    try:
+        logger.info(f"Question: {request.question[:100]}")
+        if not retriever or not generator:
+            raise HTTPException(status_code=503, detail="Service not ready. Models still loading.")
+        retrieved = retriever.retrieve(request.question, top_k=TOP_K)
+        if not retrieved:
+            return AskResponse(answer="I couldn't find relevant information to answer that question.", sources=[], retrieved=[])
+        logger.info(f"Retrieved {len(retrieved)} documents")
+        answer = generator.generate(request.question, retrieved, max_tokens=MAX_TOKENS, temperature=TEMPERATURE)
+        sources = [doc['url'] for doc in retrieved]
+        retrieved_sources = [Source(url=doc['url'], title=doc['title'], score=doc['score']) for doc in retrieved]
+        logger.info(f"Answer generated: {answer[:100]}...")
+        return AskResponse(answer=answer, sources=sources, retrieved=retrieved_sources)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error processing request: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+# ==========================================
+# Error handlers
+# ==========================================
+@app.exception_handler(404)
+async def not_found_handler(request, exc):
+    payload = {"error": "Not Found", "detail": "The requested endpoint does not exist"}
+    return JSONResponse(status_code=404, content=payload)
+
+
+@app.exception_handler(500)
+async def internal_error_handler(request, exc):
+    logger.exception("Internal server error handler fired")
+    payload = {"error": "Internal Server Error", "detail": "An unexpected error occurred"}
+    return JSONResponse(status_code=500, content=payload)
+
+# ==========================================
+# Run via: python main.py  (works) or uvicorn main:app --host 0.0.0.0 --port 8000
+# ==========================================
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.getenv("PORT", "8000"))
+    uvicorn.run(app, host="0.0.0.0", port=port, reload=False, log_level="info")
