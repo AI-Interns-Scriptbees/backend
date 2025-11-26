@@ -19,11 +19,8 @@ transformers==4.30.0
 
 # ---------------- PyTorch (CPU Only) ----------------
 torch==2.0.1
-torchaudio==2.1.0
-torchvision==0.16.0
 
 # ---------------- LLM (Local) ----------------
-gpt4all==2.8.2
 
 # ---------------- Utilities ----------------
 tqdm==4.66.4
