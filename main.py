@@ -11,14 +11,21 @@ import json
 import time
 import logging
 import hashlib
-from typing import List, Optional
+from typing import List
 from pathlib import Path
+
+# ----------------------------------------------------------------------
+# FIX FOR RENDER (IMPORTANT)
+# Render injects HTTP_PROXY which breaks the OpenAI client.
+# This prevents the "proxies" error.
+# ----------------------------------------------------------------------
+os.environ.pop("HTTP_PROXY", None)
+os.environ.pop("HTTPS_PROXY", None)
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Depends, Security, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import APIKeyHeader
-from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 # ======================================================================
@@ -48,7 +55,7 @@ logger = logging.getLogger("scriptbees")
 # CONFIG
 # ======================================================================
 
-API_KEY = os.getenv("RAG_API_KEY", "change-me")  # your bot API key  
+API_KEY = os.getenv("RAG_API_KEY", "change-me")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 if not OPENAI_API_KEY:
@@ -57,15 +64,16 @@ if not OPENAI_API_KEY:
 CONTENT_DIR = "content"
 MODEL_NAME = os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
 
-TOP_K = 1                       # FASTEST retrieval  
-MAX_TOKENS = 150                # Enough for complete answers  
-TEMPERATURE = 0.2               # Stable + fast  
+TOP_K = 1
+MAX_TOKENS = 150
+TEMPERATURE = 0.2
+
 INDEX_PATH = f"{CONTENT_DIR}/pages.faiss"
 PAGES_PATH = f"{CONTENT_DIR}/pages.json"
 META_PATH = f"{CONTENT_DIR}/pages_meta.json"
 
 # ======================================================================
-# API REQUEST MODELS
+# MODELS
 # ======================================================================
 
 class AskRequest(BaseModel):
@@ -102,7 +110,7 @@ def verify_api_key(request: Request, api_key: str = Security(api_key_header)):
     return incoming
 
 # ======================================================================
-# RESPONSE CACHE
+# CACHE
 # ======================================================================
 
 response_cache = {}
@@ -148,7 +156,7 @@ async def startup():
         from sentence_transformers import SentenceTransformer
         from openai import OpenAI
 
-        # ============== RETRIEVER CLASS ==============
+        # ============== RETRIEVER ==============
         class Retriever:
             def __init__(self):
                 logger.info("📦 Loading FAISS retriever...")
@@ -171,8 +179,7 @@ async def startup():
 
                 results = []
                 for s, idx in zip(scores[0], indices[0]):
-                    if idx == -1:
-                        continue
+                    if idx == -1: continue
                     meta = self.meta[idx]
                     page = self.pages.get(meta["id"])
                     results.append({
@@ -183,25 +190,25 @@ async def startup():
                     })
                 return results
 
-        # ============== GENERATOR CLASS (OPENAI) ==============
+        # ============== GENERATOR ==============
         class LLMGenerator:
             def __init__(self):
                 logger.info("🤖 Using OpenAI GPT-4o-mini")
-                self.client = OpenAI(api_key=OPENAI_API_KEY)
+                self.client = OpenAI(api_key=OPENAI_API_KEY)  # fixed
 
             def generate(self, question, docs):
                 context = docs[0]["text"]
 
                 prompt = f"""
-You are ScriptBees AI Assistant. Answer ONLY using this info:
+You are ScriptBees AI Assistant. Answer ONLY based on this:
 
 Context:
 {context}
 
 Question: {question}
 
-Give a short, accurate answer.
-"""
+Respond concisely.
+                """
 
                 res = self.client.chat.completions.create(
                     model="gpt-4o-mini",
@@ -232,14 +239,12 @@ Give a short, accurate answer.
 async def ask(req: AskRequest, api_key: str = Depends(verify_api_key)):
     start = time.time()
 
-    # --- cache check ---
     cached = cache_get(req.question)
     if cached:
         cached["cached"] = True
         cached["response_time_seconds"] = time.time() - start
         return cached
 
-    # --- retrieval ---
     docs = retriever.retrieve(req.question)
     if not docs:
         return AskResponse(
@@ -249,8 +254,8 @@ async def ask(req: AskRequest, api_key: str = Depends(verify_api_key)):
             response_time_seconds=time.time() - start
         )
 
-    # --- generation ---
     answer = generator.generate(req.question, docs)
+
     sources = [d["url"] for d in docs]
 
     resp = {
