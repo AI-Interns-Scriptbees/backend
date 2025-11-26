@@ -1,5 +1,6 @@
 """
 SCRIPTBEES ASSISTANT - ULTRA FAST (OPENAI VERSION)
+CLEAN RENDER-SAFE VERSION — NO PROXY, NO HTTPX OVERRIDE
 """
 
 import os
@@ -7,28 +8,17 @@ import json
 import time
 import logging
 import hashlib
-from typing import List
+from typing import List, Optional
 from pathlib import Path
 
 # ----------------------------------------------------------------------
-# ABSOLUTE FIX FOR RENDER + OPENAI PROXY BUG
+# Remove proxy variables (Render Fix)
 # ----------------------------------------------------------------------
 os.environ.pop("HTTP_PROXY", None)
 os.environ.pop("HTTPS_PROXY", None)
 
-
-import httpx
-from openai import OpenAI
-
-# Create Safe HTTP client (NO PROXIES)
-safe_http_client = httpx.Client(
-    timeout=25,
-    proxies=None,   # <--- CRITICAL
-    verify=True
-)
-
 # ----------------------------------------------------------------------
-# Load env
+# Load Environment
 # ----------------------------------------------------------------------
 from dotenv import load_dotenv
 
@@ -51,13 +41,13 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("scriptbees")
 
 # ----------------------------------------------------------------------
-# Config
+# CONFIG
 # ----------------------------------------------------------------------
 API_KEY = os.getenv("RAG_API_KEY", "change-me")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 if not OPENAI_API_KEY:
-    raise Exception("Missing OPENAI_API_KEY in .env")
+    raise Exception("❌ Missing OPENAI_API_KEY in .env")
 
 CONTENT_DIR = "content"
 MODEL_NAME = "all-MiniLM-L6-v2"
@@ -71,24 +61,24 @@ PAGES_PATH = f"{CONTENT_DIR}/pages.json"
 META_PATH = f"{CONTENT_DIR}/pages_meta.json"
 
 # ----------------------------------------------------------------------
-# FastAPI
+# FastAPI App
 # ----------------------------------------------------------------------
-from fastapi import FastAPI, Depends, HTTPException, Security, Request
+from fastapi import FastAPI, HTTPException, Depends, Security, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field
 
-app = FastAPI(title="ScriptBees Assistant")
+app = FastAPI(title="ScriptBees Assistant (OpenAI)")
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_methods=["*"],
-    allow_headers=["*"]
+    allow_headers=["*"],
 )
 
 # ----------------------------------------------------------------------
-# API Request/Response Models
+# Request/Response Models
 # ----------------------------------------------------------------------
 class AskRequest(BaseModel):
     question: str = Field(..., min_length=1)
@@ -106,29 +96,36 @@ class AskResponse(BaseModel):
     response_time_seconds: float
 
 # ----------------------------------------------------------------------
-# Security
+# API Key Security
 # ----------------------------------------------------------------------
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
-def verify_api_key(req: Request, api_key: str = Security(api_key_header)):
+def verify_api_key(request: Request, api_key: str = Security(api_key_header)):
     incoming = api_key or ""
+
+    # Support "Authorization: Bearer"
     if not incoming:
-        auth = req.headers.get("authorization", "")
+        auth = request.headers.get("authorization", "")
         if auth.lower().startswith("bearer "):
-            incoming = auth.split(" ", 1)[1]
+            incoming = auth.split(" ", 1)[1].strip()
+
     if incoming != API_KEY:
-        raise HTTPException(status_code=403, detail="Invalid API key")
+        raise HTTPException(status_code=403, detail="Invalid or missing API key")
+
     return incoming
 
 # ----------------------------------------------------------------------
 # Cache
 # ----------------------------------------------------------------------
-cache = {}
-def ckey(q): return hashlib.md5(q.lower().encode()).hexdigest()
+response_cache = {}
+
+def cache_key(q): return hashlib.md5(q.lower().encode()).hexdigest()
 
 # ----------------------------------------------------------------------
-# Startup
+# Startup — load FAISS + OpenAI
 # ----------------------------------------------------------------------
+from openai import OpenAI
+
 retriever = None
 generator = None
 
@@ -136,65 +133,67 @@ generator = None
 async def startup():
     global retriever, generator
 
-    logger.info("🚀 Starting ScriptBees Assistant")
+    logger.info("🚀 Starting ScriptBees Assistant (OpenAI Ultra-Fast)")
 
     import faiss
     from sentence_transformers import SentenceTransformer
 
-    # --------------------- Retriever ---------------------
+    # ------------------------ RETRIEVER ------------------------
     class Retriever:
         def __init__(self):
-            logger.info("📦 Loading FAISS...")
+            logger.info("📦 Loading FAISS retriever...")
             self.model = SentenceTransformer(MODEL_NAME)
             self.index = faiss.read_index(INDEX_PATH)
 
-            with open(META_PATH) as f:
+            with open(META_PATH, "r", encoding="utf8") as f:
                 self.meta = json.load(f)
 
-            with open(PAGES_PATH) as f:
+            with open(PAGES_PATH, "r", encoding="utf8") as f:
                 pages = json.load(f)
 
             self.pages = {p["id"]: p for p in pages}
 
+            logger.info(f"✓ Loaded {self.index.ntotal} embedded documents")
+
         def retrieve(self, question: str):
-            v = self.model.encode([question], normalize_embeddings=True).astype("float32")
-            scores, indices = self.index.search(v, TOP_K)
+            vec = self.model.encode([question], normalize_embeddings=True).astype("float32")
+            scores, indices = self.index.search(vec, TOP_K)
 
             results = []
             for s, idx in zip(scores[0], indices[0]):
                 if idx == -1:
                     continue
+
                 meta = self.meta[idx]
-                page = self.pages[meta["id"]]
+                page = self.pages.get(meta["id"])
+
                 results.append({
                     "url": meta["url"],
                     "title": meta["title"],
                     "score": float(s),
                     "text": page["text"][:500]
                 })
+
             return results
 
-    # ----------------------- LLM -------------------------
+    # ------------------------ LLM GENERATOR ------------------------
     class LLMGenerator:
         def __init__(self):
-            logger.info("🤖 Using GPT-4o-mini (SAFE MODE)")
-            self.client = OpenAI(
-                api_key=OPENAI_API_KEY,
-                http_client=safe_http_client  # <--- FIX
-            )
+            logger.info("🤖 Using OpenAI GPT-4o-mini")
+            self.client = OpenAI(api_key=OPENAI_API_KEY)
 
         def generate(self, question, docs):
-            ctx = docs[0]["text"]
+            context = docs[0]["text"]
 
             prompt = f"""
-You are ScriptBees Assistant.
-Answer ONLY from this context:
+You are ScriptBees AI Assistant.
+Answer ONLY using this context:
 
-{ctx}
+{context}
 
 Question: {question}
 
-Short and accurate answer:
+Give a short, accurate answer.
 """
 
             res = self.client.chat.completions.create(
@@ -204,51 +203,68 @@ Short and accurate answer:
                 temperature=TEMPERATURE
             )
 
-            text = res.choices[0].message.content.strip()
-            return text + f"\n\n[Source: {docs[0]['url']}]"
+            answer = res.choices[0].message.content.strip()
+            return answer + f"\n\n[Source: {docs[0]['url']}]"
 
     retriever = Retriever()
     generator = LLMGenerator()
 
-    logger.info("✅ Assistant Ready")
+    logger.info("✅ ScriptBees Assistant READY")
 
 # ----------------------------------------------------------------------
-# Routes
+# Ask Endpoint
 # ----------------------------------------------------------------------
 @app.post("/api/ask", response_model=AskResponse)
 async def ask(req: AskRequest, api_key: str = Depends(verify_api_key)):
     start = time.time()
 
-    if ckey(req.question) in cache:
-        r = cache[ckey(req.question)]
-        r["cached"] = True
-        r["response_time_seconds"] = time.time() - start
-        return r
+    key = cache_key(req.question)
+    if key in response_cache:
+        cached = response_cache[key]
+        cached["cached"] = True
+        cached["response_time_seconds"] = time.time() - start
+        return cached
 
     docs = retriever.retrieve(req.question)
     if not docs:
-        return AskResponse(answer="No info found.", sources=[], retrieved=[], cached=False, response_time_seconds=0)
+        return AskResponse(
+            answer="No relevant information found.",
+            sources=[],
+            retrieved=[],
+            cached=False,
+            response_time_seconds=time.time() - start
+        )
 
     answer = generator.generate(req.question, docs)
-    sources = [d["url"] for d in docs]
 
-    resp = {
+    response = {
         "answer": answer,
-        "sources": sources,
+        "sources": [d["url"] for d in docs],
         "retrieved": [Source(**d) for d in docs],
         "cached": False,
         "response_time_seconds": time.time() - start
     }
 
-    cache[ckey(req.question)] = resp
-    return resp
-
-@app.get("/")
-async def root():
-    return {"service": "ScriptBees RAG", "status": "online"}
+    response_cache[key] = response
+    return response
 
 # ----------------------------------------------------------------------
-# Run
+# Health & Root
+# ----------------------------------------------------------------------
+@app.get("/health")
+async def health():
+    return {
+        "status": "healthy",
+        "documents": retriever.index.ntotal if retriever else 0,
+        "model": "gpt-4o-mini"
+    }
+
+@app.get("/")
+async def home():
+    return {"service": "ScriptBees Assistant", "mode": "openai", "status": "online"}
+
+# ----------------------------------------------------------------------
+# RUN LOCAL
 # ----------------------------------------------------------------------
 if __name__ == "__main__":
     import uvicorn
