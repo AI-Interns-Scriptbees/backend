@@ -18,7 +18,7 @@ sentence-transformers==2.2.2
 transformers==4.30.0
 
 # ---------------- PyTorch (CPU Only) ----------------
-torch==2.1.0
+torch==2.0.1
 torchaudio==2.1.0
 torchvision==0.16.0
 
