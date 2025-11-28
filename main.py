@@ -1,11 +1,12 @@
 """
 SCRIPTBEES ASSISTANT - UPDATED
 - CORS configured from env (FRONTEND_ORIGINS)
+- If FRONTEND_ORIGINS='*' we disable credentials to avoid CORSMiddleware conflict
 - Safer OpenAI client init and error handling
-- Better logging and graceful failures
-- Keeps proxy removal and safe httpx client
+- Better logging and graceful failures when FAISS / models missing
 - Adds /favicon.ico 204 to avoid 404 noise
 - Middleware logs incoming paths to help debug double-slash issues
+- Ensures Source model construction avoids passing unexpected fields
 """
 
 import os
@@ -38,6 +39,7 @@ safe_http_client = httpx.Client(
 # ------------------------------
 from dotenv import load_dotenv
 
+
 def find_env():
     cur = Path(__file__).resolve().parent
     for _ in range(10):
@@ -57,9 +59,10 @@ API_KEY = os.getenv("RAG_API_KEY", "change-me")
 # e.g. https://frontend-qghcpai70-sharief44s-projects.vercel.app,https://example.com
 # If not provided, defaults to '*' (allow all) for quick debugging — change in production.
 _frontend_env = os.getenv("FRONTEND_ORIGINS", "*")
-if _frontend_env.strip() == "":
+_frontend_env = _frontend_env.strip()
+if _frontend_env == "":
     FRONTEND_ORIGINS = ["*"]
-elif _frontend_env.strip() == "*":
+elif _frontend_env == "*":
     FRONTEND_ORIGINS = ["*"]
 else:
     FRONTEND_ORIGINS = [o.strip() for o in _frontend_env.split(",") if o.strip()]
@@ -91,7 +94,7 @@ PAGES_PATH = f"{CONTENT_DIR}/pages.json"
 # ------------------------------
 # FastAPI App
 # ------------------------------
-from fastapi import FastAPI, Depends, HTTPException, Security, Request
+from fastapi import FastAPI, Depends, HTTPException, Security, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field
@@ -99,11 +102,17 @@ from fastapi.responses import JSONResponse
 
 app = FastAPI(title="ScriptBees Assistant — Final Version")
 
+# Determine cors kwargs safely
+_allow_credentials = True
+if FRONTEND_ORIGINS == ["*"]:
+    # FastAPI's CORSMiddleware will raise if allow_origins==["*"] and allow_credentials==True
+    _allow_credentials = False
+
 # Add CORS middleware immediately after app creation
 app.add_middleware(
     CORSMiddleware,
     allow_origins=FRONTEND_ORIGINS,
-    allow_credentials=True,
+    allow_credentials=_allow_credentials,
     allow_methods=["GET", "POST", "OPTIONS", "PUT", "DELETE", "PATCH"],
     allow_headers=["*"],
 )
@@ -162,13 +171,25 @@ async def startup():
 
     logger.info("🚀 Starting ScriptBees AI Assistant...")
 
-    import faiss
-    from sentence_transformers import SentenceTransformer
+    try:
+        import faiss
+        from sentence_transformers import SentenceTransformer
+    except Exception as e:
+        logger.exception("Failed to import FAISS / sentence_transformers. Make sure dependencies are installed.")
+        raise SystemExit("Missing FAISS or sentence-transformers dependencies: " + str(e))
 
     # Retriever
     class Retriever:
         def __init__(self):
             logger.info("📦 Loading FAISS + metadata...")
+
+            # validate files up-front for clearer errors
+            if not Path(INDEX_PATH).exists():
+                raise SystemExit(f"Missing FAISS index at {INDEX_PATH}")
+            if not Path(META_PATH).exists():
+                raise SystemExit(f"Missing metadata file at {META_PATH}")
+            if not Path(PAGES_PATH).exists():
+                raise SystemExit(f"Missing pages file at {PAGES_PATH}")
 
             self.model = SentenceTransformer(MODEL_NAME)
             self.index = faiss.read_index(INDEX_PATH)
@@ -181,7 +202,7 @@ async def startup():
 
             self.pages = {p["id"]: p for p in pages}
 
-            logger.info(f"✓ Loaded {self.index.ntotal} ScriptBees pages")
+            logger.info(f"✓ Loaded {getattr(self.index, 'ntotal', 'unknown')} ScriptBees pages")
 
         def retrieve(self, question):
             vec = self.model.encode([question], normalize_embeddings=True).astype("float32")
@@ -298,10 +319,14 @@ async def ask(req: AskRequest, key: str = Depends(verify_api_key)):
 
     answer = generator.generate(req.question, docs)
 
+    # Build Source objects explicitly to avoid passing unexpected extra fields
+    first = docs[0]
+    source_obj = Source(url=first.get("url", ""), title=first.get("title", ""), score=first.get("score", 0.0))
+
     resp = {
         "answer": answer,
-        "sources": [docs[0]["url"]],
-        "retrieved": [Source(**docs[0])],
+        "sources": [first.get("url", "")],
+        "retrieved": [source_obj],
         "cached": False,
         "response_time_seconds": time.time() - start
     }
@@ -316,7 +341,7 @@ async def home():
 # Add a small favicon route so the logs don't fill with 404s
 @app.get("/favicon.ico")
 async def favicon():
-    return JSONResponse(status_code=204, content=None)
+    return Response(status_code=204)
 
 # ------------------------------
 # Run Local

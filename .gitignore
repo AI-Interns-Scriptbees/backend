@@ -8,3 +8,4 @@ bot/
 *.gguf
 *.pem
 .DS_Store
+.venv
