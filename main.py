@@ -1,12 +1,11 @@
 """
-SCRIPTBEES ASSISTANT - FINAL CLEAN VERSION
------------------------------------------
-✔ Uses ScriptBees FAISS documents only
-✔ Always returns REAL ScriptBees URLs from pages_meta.json
-✔ NO fake websites in answer
-✔ NO voice output
-✔ NO proxies (safe for Render)
-✔ Stable OpenAI generation
+SCRIPTBEES ASSISTANT - UPDATED
+- CORS configured from env (FRONTEND_ORIGINS)
+- Safer OpenAI client init and error handling
+- Better logging and graceful failures
+- Keeps proxy removal and safe httpx client
+- Adds /favicon.ico 204 to avoid 404 noise
+- Middleware logs incoming paths to help debug double-slash issues
 """
 
 import os
@@ -35,7 +34,7 @@ safe_http_client = httpx.Client(
 )
 
 # ------------------------------
-# Load env
+# Load env (optionally from .env for local dev)
 # ------------------------------
 from dotenv import load_dotenv
 
@@ -54,14 +53,26 @@ if env:
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 API_KEY = os.getenv("RAG_API_KEY", "change-me")
 
+# FRONTEND_ORIGINS should be a comma-separated list of origins (including protocol),
+# e.g. https://frontend-qghcpai70-sharief44s-projects.vercel.app,https://example.com
+# If not provided, defaults to '*' (allow all) for quick debugging — change in production.
+_frontend_env = os.getenv("FRONTEND_ORIGINS", "*")
+if _frontend_env.strip() == "":
+    FRONTEND_ORIGINS = ["*"]
+elif _frontend_env.strip() == "*":
+    FRONTEND_ORIGINS = ["*"]
+else:
+    FRONTEND_ORIGINS = [o.strip() for o in _frontend_env.split(",") if o.strip()]
+
 if not OPENAI_API_KEY:
-    raise Exception("Missing OPENAI_API_KEY in .env")
+    # Stop on startup: it's better to fail early than run broken.
+    raise SystemExit("Missing OPENAI_API_KEY environment variable. Set OPENAI_API_KEY and redeploy.")
 
 # ------------------------------
 # Logging
 # ------------------------------
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(" scriptbees ")
+logger = logging.getLogger("scriptbees")
 
 # ------------------------------
 # Config
@@ -84,14 +95,17 @@ from fastapi import FastAPI, Depends, HTTPException, Security, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field
+from fastapi.responses import JSONResponse
 
 app = FastAPI(title="ScriptBees Assistant — Final Version")
 
+# Add CORS middleware immediately after app creation
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=FRONTEND_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "OPTIONS", "PUT", "DELETE", "PATCH"],
     allow_headers=["*"],
-    allow_methods=["*"],
 )
 
 # ------------------------------
@@ -122,7 +136,7 @@ def verify_api_key(req: Request, key: str = Security(api_key_header)):
 
     if not incoming:
         auth = req.headers.get("authorization", "")
-        if auth.lower().startswith("bearer "):
+        if auth and auth.lower().startswith("bearer "):
             incoming = auth.split(" ", 1)[1]
 
     if incoming != API_KEY:
@@ -180,9 +194,8 @@ async def startup():
                 meta = self.meta[idx]
                 page = self.pages.get(meta["id"], {})
 
-                # Only ScriptBees pages (from your index)
                 results.append({
-                    "url": meta.get("url", ""),     # REAL ScriptBees URL
+                    "url": meta.get("url", ""),
                     "title": meta.get("title", ""),
                     "score": float(s),
                     "text": page.get("text", "")[:1200]
@@ -192,10 +205,8 @@ async def startup():
     # Generator
     class LLMGenerator:
         def __init__(self):
-            self.client = OpenAI(
-                api_key=OPENAI_API_KEY,
-                http_client=safe_http_client
-            )
+            # initialize OpenAI client with the safe httpx client
+            self.client = OpenAI(api_key=OPENAI_API_KEY, http_client=safe_http_client)
 
         def generate(self, question, docs):
             context = docs[0]["text"]
@@ -211,19 +222,54 @@ Question: {question}
 
 Give a short and correct answer based ONLY on ScriptBees website.
 """
+            try:
+                res = self.client.chat.completions.create(
+                    model="gpt-4o-mini",
+                    messages=[{"role": "user", "content": prompt}],
+                    max_tokens=MAX_TOKENS,
+                    temperature=TEMPERATURE
+                )
+            except Exception as e:
+                # Map common OpenAI errors to cleaner HTTPExceptions
+                msg = str(e)
+                logger.exception("OpenAI request failed")
+                if "401" in msg or "invalid_api_key" in msg.lower():
+                    raise HTTPException(status_code=502, detail="Upstream OpenAI authentication error")
+                if "429" in msg or "rate limit" in msg.lower():
+                    raise HTTPException(status_code=429, detail="Upstream OpenAI rate limit")
+                raise HTTPException(status_code=502, detail=f"Upstream OpenAI error: {msg}")
 
-            res = self.client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=MAX_TOKENS,
-                temperature=TEMPERATURE
-            )
-            return res.choices[0].message.content.strip()
+            # Extract answer robustly
+            answer_text = ""
+            try:
+                choices = getattr(res, "choices", None) or res.get("choices", None)
+                if choices and len(choices) > 0:
+                    choice = choices[0]
+                    message = getattr(choice, "message", None) or choice.get("message", None)
+                    if isinstance(message, dict):
+                        answer_text = message.get("content", "").strip()
+                    else:
+                        answer_text = getattr(message, "content", "").strip()
+            except Exception:
+                logger.exception("Failed to parse OpenAI response")
+
+            if not answer_text:
+                answer_text = "No answer returned from upstream."
+
+            return answer_text
 
     retriever = Retriever()
     generator = LLMGenerator()
 
     logger.info("✅ ScriptBees Assistant is READY")
+
+# ------------------------------
+# Small middleware to log incoming path (helps debug double-slash issues)
+# ------------------------------
+@app.middleware("http")
+async def log_path(request: Request, call_next):
+    logger.info("Incoming request: %s %s", request.method, request.url.path)
+    return await call_next(request)
 
 # ------------------------------
 # API Route
@@ -233,8 +279,9 @@ async def ask(req: AskRequest, key: str = Depends(verify_api_key)):
     start = time.time()
 
     # Check cache
-    if ckey(req.question) in cache:
-        r = cache[ckey(req.question)]
+    h = ckey(req.question)
+    if h in cache:
+        r = cache[h]
         r["cached"] = True
         r["response_time_seconds"] = time.time() - start
         return r
@@ -253,18 +300,23 @@ async def ask(req: AskRequest, key: str = Depends(verify_api_key)):
 
     resp = {
         "answer": answer,
-        "sources": [docs[0]["url"]],       # REAL ScriptBees URL
+        "sources": [docs[0]["url"]],
         "retrieved": [Source(**docs[0])],
         "cached": False,
         "response_time_seconds": time.time() - start
     }
 
-    cache[ckey(req.question)] = resp
+    cache[h] = resp
     return resp
 
 @app.get("/")
 async def home():
     return {"status": "online", "bot": "ScriptBees AI"}
+
+# Add a small favicon route so the logs don't fill with 404s
+@app.get("/favicon.ico")
+async def favicon():
+    return JSONResponse(status_code=204, content=None)
 
 # ------------------------------
 # Run Local
