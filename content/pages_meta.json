@@ -1,27 +1,23 @@
 [
   {
-    "id": 0,
-    "url": "https://scriptbees.com/wp-sitemap-posts-post-1.xml",
-    "title": "https://scriptbees.com/wp-sitemap-posts-post-1.xml"
+    "id": "0",
+    "path": "documents.json",
+    "title": "documents",
+    "url": "",
+    "snippet": "[ \"What is RAG?\", \"RAG stands for Retrieval Augmented Generation.\", \"Chatbots can answer from custom knowledge.\" ]"
   },
   {
-    "id": 1,
-    "url": "https://scriptbees.com/wp-sitemap-posts-page-1.xml",
-    "title": "https://scriptbees.com/wp-sitemap-posts-page-1.xml"
+    "id": "1",
+    "path": "pages.json",
+    "title": "pages",
+    "url": "",
+    "snippet": "[ { \"id\": 0, \"text\": \"https://scriptbees.com/what-is-the-job-of-an-immigration-consultant/ 2024-03-20T14:08:10+00:00 https://scriptbees.com/what-is-the-job-of-an-immigration-consultant-2/ 2024-03-20T14:06:44+00:00 https://scriptbees.com/what-is-the-job-of-an-immigration-consultant-3/ 2024-03-20T14:05:36+00:00 https://scriptbees.com/what-is-the-job-of-an-immigration-consultant-4/ 2024-03-20T14:03:48+00:00 https://scriptbees.com/what-is-the-job-of-an-immigration-consultant-5/ 2024-03-20T14:02:04+00:00 https://scriptbees.com/what-is-the-job-of-an-immigration-consultant-6/ 2024-03-20T13:59:27+00:00 https://scriptbees.com/what-is-the-job-of-an-immigration-consultant-7/ 2024-03-20T13:58:03+00:00 https://scriptbees.com/what-is-the-job-of-an-immigration-consultant-8/ 2024-03-20T13:56:10+00:00 https://scriptbees.com/what-is-the-job-of-an-immigration-consultant-9/ 2024-03-20T13:53:13+00:00 https://scriptbees.com/what-is-the-job-of-an-immigration-consultant-10/ 2024-03-20T13:51:14+00:00 https://scriptbees.com/what-is-the-job-of-an-immigration-consultant-11/ 2024-03-20T13:48:48+00:00 https://scriptbees.com/what-is-the-job-of-an-immigration-consultant-12/ 2024-03-20T14:09:56+00:00\" }, { \"id\": 1, \"text\": \"https://scriptbees.com/sample-page/ 2024-01-05T11:04:12+00:00 https://scriptbees.com/home-page-1/ 2024-01-05T11:11:58+00:00 https://scriptbees.com/home-page-2/ 2024-01-05T11:11:58+00:00 https://scriptbees.com/about/ 2024-12-20T04:54:58+00:00 https://scriptbees.com/services/ 2024-01-05T11:11:58+00:00 https://scriptbees.com/faq-page/ 2024-01-05T11:11:58+00:00 https://scriptbees.com/team-page/ 2024-01-05T11:11:58+00:00 https://scriptbees.com/pricing-page/ 2024-01-05T11:11:58+00:00 https://scriptbees.com/contact-page/ 2025-11-10T07:57:55+00:00 https://scriptbees.com/testimonial/ 2024-01-05T11:11:58+00:00 https://scriptbees.com/portfolio-page/ 2024-01-05T11:11:58+00:00 https://scriptbees.com/country-page/ 2024-01-05T11:11:58+00:00 https://scriptbees.com/country-page-two/ 2024-01-05T1"
   },
   {
-    "id": 2,
-    "url": "https://scriptbees.com/wp-sitemap-taxonomies-category-1.xml",
-    "title": "https://scriptbees.com/wp-sitemap-taxonomies-category-1.xml"
-  },
-  {
-    "id": 3,
-    "url": "https://scriptbees.com/wp-sitemap-taxonomies-post_tag-1.xml",
-    "title": "https://scriptbees.com/wp-sitemap-taxonomies-post_tag-1.xml"
-  },
-  {
-    "id": 4,
-    "url": "https://scriptbees.com/wp-sitemap-users-1.xml",
-    "title": "https://scriptbees.com/wp-sitemap-users-1.xml"
+    "id": "2",
+    "path": "pages_meta.json",
+    "title": "pages_meta",
+    "url": "",
+    "snippet": "[ { \"id\": 0, \"url\": \"https://scriptbees.com/wp-sitemap-posts-post-1.xml\", \"title\": \"https://scriptbees.com/wp-sitemap-posts-post-1.xml\" }, { \"id\": 1, \"url\": \"https://scriptbees.com/wp-sitemap-posts-page-1.xml\", \"title\": \"https://scriptbees.com/wp-sitemap-posts-page-1.xml\" }, { \"id\": 2, \"url\": \"https://scriptbees.com/wp-sitemap-taxonomies-category-1.xml\", \"title\": \"https://scriptbees.com/wp-sitemap-taxonomies-category-1.xml\" }, { \"id\": 3, \"url\": \"https://scriptbees.com/wp-sitemap-taxonomies-post_tag-1.xml\", \"title\": \"https://scriptbees.com/wp-sitemap-taxonomies-post_tag-1.xml\" }, { \"id\": 4, \"url\": \"https://scriptbees.com/wp-sitemap-users-1.xml\", \"title\": \"https://scriptbees.com/wp-sitemap-users-1.xml\" } ]"
   }
 ]
