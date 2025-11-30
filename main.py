@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-main.py - Robust memmap Gemini server for ScriptBees (UPDATED)
+main.py - Robust memmap Gemini server for ScriptBees (UPDATED, full)
 
-Changes:
-- Uses genai_client.models.embed_content(...) instead of genai_client.embeddings.create(...)
-- Robust parsing of embedding responses across SDK versions
+This file:
+- Uses genai_client.models.embed_content(...) (robust across SDKs)
+- Extracts numeric embeddings from SDK wrapper objects (ContentEmbedding etc.)
 - Auto-discovers a working embedding model at startup if EMBED_MODEL fails
-- Keeps original repair behavior for embeddings.npy
+- Loads/repairs content/pages.json and content/embeddings.npy (memmap)
+- Provides / endpoint showing selected embed model
 """
 
 import os
@@ -18,7 +19,7 @@ import json
 import hashlib
 import logging
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Any
 
 import numpy as np
 from dotenv import load_dotenv
@@ -28,13 +29,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field
 
-# Try importing genai; keep None if unavailable (graceful degrade)
+# Try importing genai; keep None if unavailable
 try:
     from google import genai
 except Exception:
     genai = None
 
-# Load .env if present (local dev)
+# -------- Load .env (if present) --------
 def find_env():
     cur = Path(__file__).resolve().parent
     for _ in range(5):
@@ -47,7 +48,7 @@ env = find_env()
 if env:
     load_dotenv(env)
 
-# Config from env (defaults)
+# -------- Config from env (defaults) --------
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 API_KEY = os.getenv("RAG_API_KEY", "change-me")
 FRONTEND_ORIGINS = os.getenv("FRONTEND_ORIGINS", "*")
@@ -61,17 +62,23 @@ CONTENT_DIR = Path("content")
 PAGES_FILE = CONTENT_DIR / "pages.json"
 EMBED_FILE = CONTENT_DIR / "embeddings.npy"
 
-# Logging
+# -------- Logging --------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("scriptbees-memmap-robust")
 
-# FastAPI app & CORS
+# -------- FastAPI app & CORS --------
 app = FastAPI(title="ScriptBees — Gemini Memmap (Robust)")
 _allow_credentials = False if FRONTEND_ORIGINS.strip() == "*" else True
 origins = [o.strip() for o in FRONTEND_ORIGINS.split(",")] if FRONTEND_ORIGINS != "*" else ["*"]
-app.add_middleware(CORSMiddleware, allow_origins=origins, allow_credentials=_allow_credentials, allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=_allow_credentials,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-# Models
+# -------- Models --------
 class AskRequest(BaseModel):
     question: str = Field(..., min_length=1)
 
@@ -87,8 +94,9 @@ class AskResponse(BaseModel):
     cached: bool
     response_time_seconds: float
 
-# API Key security
+# -------- API Key security --------
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+
 def verify_api_key(req: Request, key: str = Depends(api_key_header)):
     incoming = key or ""
     if not incoming:
@@ -99,53 +107,61 @@ def verify_api_key(req: Request, key: str = Depends(api_key_header)):
         raise HTTPException(status_code=403, detail="Invalid API key")
     return incoming
 
-# Cache util
-def ckey(q): return hashlib.md5(q.lower().encode()).hexdigest()
+# -------- Cache util --------
+def ckey(q: str) -> str:
+    return hashlib.md5(q.lower().encode()).hexdigest()
+
 cache = {}
 
-# Globals for retriever
-pages = []
-embeddings = None   # numpy memmap or ndarray
+# -------- Globals for retriever --------
+pages: List[dict] = []
+embeddings: Optional[np.memmap] = None   # numpy memmap or ndarray
 emb_dim = 0
 num_pages = 0
 retriever_enabled = False
 
-# Utility: attempt to load pages.json
-def load_pages():
+# -------- Utilities: load pages + embeddings --------
+def load_pages() -> bool:
     global pages, num_pages
     if not PAGES_FILE.exists():
         logger.error("Missing pages.json at %s", PAGES_FILE)
         return False
-    with open(PAGES_FILE, "r", encoding="utf-8") as f:
-        pages = json.load(f)
-    num_pages = len(pages)
-    logger.info("Loaded %d pages from %s", num_pages, PAGES_FILE)
-    return True
+    try:
+        with open(PAGES_FILE, "r", encoding="utf-8") as f:
+            pages = json.load(f)
+        num_pages = len(pages)
+        logger.info("Loaded %d pages from %s", num_pages, PAGES_FILE)
+        return True
+    except Exception as e:
+        logger.exception("Failed to load pages.json: %s", e)
+        return False
 
-# Utility: try robustly load embeddings memmap or repair if possible
-def try_load_or_repair_embeddings():
+def try_load_or_repair_embeddings() -> bool:
     global embeddings, emb_dim, retriever_enabled
     if not EMBED_FILE.exists():
         logger.error("Missing embeddings.npy at %s", EMBED_FILE)
         return False
 
-    # Quick checks by file size
-    size_bytes = EMBED_FILE.stat().st_size
-    if size_bytes % 4 != 0:
-        logger.error("Embeddings file size (%d) not divisible by 4 -> not float32", size_bytes)
-        return False
-    total_floats = size_bytes // 4
-    if num_pages <= 0:
-        logger.error("num_pages is zero; cannot shape embeddings")
-        return False
+    try:
+        size_bytes = EMBED_FILE.stat().st_size
+        if size_bytes % 4 != 0:
+            logger.error("Embeddings file size (%d) not divisible by 4 -> not float32", size_bytes)
+            return False
+        total_floats = size_bytes // 4
+        if num_pages <= 0:
+            logger.error("num_pages is zero; cannot shape embeddings")
+            return False
+        if total_floats % num_pages != 0:
+            logger.error("Total floats (%d) not divisible by num_pages (%d) -> cannot reshape", total_floats, num_pages)
+            return False
 
-    if total_floats % num_pages == 0:
         dim = total_floats // num_pages
         logger.info("Inferred embeddings shape: (%d, %d)", num_pages, dim)
-        # Try memmap load as (num_pages, dim)
+
+        # Try memmap load
         try:
             mm = np.memmap(str(EMBED_FILE), dtype=np.float32, mode="r", shape=(num_pages, dim))
-            # basic sanity: check NaNs
+            # quick sanity
             sample = mm[0]
             if np.isnan(sample).any():
                 logger.warning("Embeddings contain NaNs in sample row.")
@@ -156,7 +172,7 @@ def try_load_or_repair_embeddings():
             return True
         except Exception as e:
             logger.warning("Memmap load failed for shape (%d,%d): %s", num_pages, dim, e)
-            # try fallback: load full array and reshape
+            # fallback: load and reshape
             try:
                 arr = np.load(str(EMBED_FILE), mmap_mode="r")
                 arr = np.asarray(arr, dtype=np.float32)
@@ -167,12 +183,9 @@ def try_load_or_repair_embeddings():
                 else:
                     logger.warning("Loaded array shape %s not matching expected (%d,%d)", arr.shape, num_pages, dim)
                     return False
-                # save a memmap-style .npy (overwrite safe path embeddings_repaired.npy then rename)
                 repaired = str(EMBED_FILE.parent / "embeddings_repaired.npy")
                 np.save(repaired, arr.astype(np.float32))
-                # replace original
                 os.replace(repaired, str(EMBED_FILE))
-                # load memmap fresh
                 mm2 = np.memmap(str(EMBED_FILE), dtype=np.float32, mode="r", shape=(num_pages, dim))
                 embeddings = mm2
                 emb_dim = dim
@@ -182,12 +195,11 @@ def try_load_or_repair_embeddings():
             except Exception as e2:
                 logger.exception("Failed fallback reshape & load: %s", e2)
                 return False
-    else:
-        # cannot reshape cleanly
-        logger.error("Total floats (%d) not divisible by num_pages (%d) -> cannot reshape", total_floats, num_pages)
+    except Exception as outer_e:
+        logger.exception("Unexpected error when loading embeddings: %s", outer_e)
         return False
 
-# Startup: load pages + embeddings (try repair)
+# Startup: load pages + embeddings
 logger.info("Starting ScriptBees memmap server (robust startup)...")
 _pages_ok = load_pages()
 if _pages_ok:
@@ -201,28 +213,25 @@ else:
     retriever_enabled = False
     logger.warning("Pages not loaded. Retriever disabled. Ensure content/pages.json exists.")
 
-# Create genai client (even if retriever disabled we keep client init)
+# -------- Create genai client --------
 if genai is None:
     logger.warning("google-genai client not installed. Gemini features will fail if invoked.")
     genai_client = None
 else:
     try:
-        if GEMINI_API_KEY:
-            genai_client = genai.Client(api_key=GEMINI_API_KEY)
-        else:
-            genai_client = genai.Client()
+        genai_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else genai.Client()
     except Exception as e:
         logger.exception("Failed to create genai client: %s", e)
         genai_client = None
 
-# Auto-discover embedding model if configured model doesn't work
-def _auto_discover_embedding_model(client, configured_model: str) -> str:
+# -------- Auto-discover embedding model (if configured model fails) --------
+def _auto_discover_embedding_model(client: Any, configured_model: str) -> str:
     global EMBED_MODEL
     if client is None:
         logger.warning("No genai client available for auto-discovery.")
         return configured_model
 
-    # If user set a model, try it first
+    # Try configured model first
     if configured_model:
         try:
             logger.info("Testing configured EMBED_MODEL='%s' ...", configured_model)
@@ -236,9 +245,8 @@ def _auto_discover_embedding_model(client, configured_model: str) -> str:
             return configured_model
         except Exception as e:
             logger.warning("Configured EMBED_MODEL '%s' failed test: %s", configured_model, getattr(e, "message", str(e)))
-            # fall through to discovery
 
-    # Try list models
+    # Try to list models
     raw = None
     try:
         logger.info("Listing models to discover embedding-capable model...")
@@ -255,7 +263,7 @@ def _auto_discover_embedding_model(client, configured_model: str) -> str:
         logger.warning("List models call failed: %s", e)
         raw = None
 
-    # Normalize raw into iterable items
+    # Normalize into iterable items
     items = []
     try:
         if raw is None:
@@ -329,94 +337,175 @@ try:
 except Exception as e:
     logger.warning("Auto-discovery encountered an exception: %s", e)
 
-# Helper: embed question using Gemini (clean, robust)
+# -------- Robust embedding extraction --------
+def _extract_numeric_from_obj(obj: Any) -> Optional[List[float]]:
+    """
+    Try many strategies to pull a plain list of numbers from an SDK wrapper object.
+    Returns a Python list of floats or None.
+    """
+    # 1) If it's a dict with common keys
+    if isinstance(obj, dict):
+        for k in ("embedding", "value", "values", "vector", "data", "content"):
+            if k in obj:
+                res = _extract_numeric_from_obj(obj[k])
+                if res is not None:
+                    return res
+
+    # 2) Try common attributes
+    for attr in ("embedding", "value", "values", "vector", "content", "content_embedding"):
+        try:
+            if hasattr(obj, attr):
+                cand = getattr(obj, attr)
+                res = _extract_numeric_from_obj(cand)
+                if res is not None:
+                    return res
+        except Exception:
+            pass
+
+    # 3) If it exposes numpy(), tolist(), list-like conversions
+    try:
+        if hasattr(obj, "numpy"):
+            arr = obj.numpy()
+            if hasattr(arr, "__iter__"):
+                return [float(x) for x in arr]
+    except Exception:
+        pass
+
+    try:
+        if hasattr(obj, "to_list"):
+            arr = obj.to_list()
+            if hasattr(arr, "__iter__"):
+                return [float(x) for x in arr]
+    except Exception:
+        pass
+
+    try:
+        if hasattr(obj, "tolist"):
+            arr = obj.tolist()
+            if hasattr(arr, "__iter__"):
+                return [float(x) for x in arr]
+    except Exception:
+        pass
+
+    # 4) If it's already a list/tuple/ndarray
+    if isinstance(obj, (list, tuple, np.ndarray)):
+        try:
+            return [float(x) for x in obj]
+        except Exception:
+            # elements might be wrapped; try flattening via recursion
+            out = []
+            for el in obj:
+                el_res = _extract_numeric_from_obj(el)
+                if el_res is None:
+                    return None
+                out.extend(el_res)
+            return out if out else None
+
+    # 5) Iterable fallback (but not string/bytes)
+    try:
+        if hasattr(obj, "__iter__") and not isinstance(obj, (str, bytes)):
+            lst = list(obj)
+            # if the iterable yields numbers directly
+            try:
+                return [float(x) for x in lst]
+            except Exception:
+                # else try recursive extraction
+                out = []
+                for el in lst:
+                    er = _extract_numeric_from_obj(el)
+                    if er is None:
+                        return None
+                    out.extend(er)
+                return out if out else None
+    except Exception:
+        pass
+
+    return None
+
 def get_embedding_for_text(text: str) -> np.ndarray:
     """
-    Returns a normalized float32 numpy vector for the provided text.
-    Raises HTTPException(502) if embedding client is unavailable or the upstream response
-    shape is unexpected.
+    Request an embedding and return a normalized float32 numpy vector.
     """
     if genai_client is None:
         logger.error("Embedding client not available (genai_client is None)")
         raise HTTPException(status_code=502, detail="Embedding client not available")
 
     try:
-        # call embed_content with a single-item list (most SDKs accept list of contents)
-        resp = genai_client.models.embed_content(
-            model=EMBED_MODEL,
-            contents=[text]
-        )
+        resp = genai_client.models.embed_content(model=EMBED_MODEL, contents=[text])
     except Exception as e:
         logger.exception("Embedding request failed: %s", e)
         raise HTTPException(status_code=502, detail="Upstream embedding error")
 
-    # Robustly extract the numeric embedding from several possible shapes
-    embedding = None
+    # Find candidate wrapper that likely contains numbers
+    candidate = None
 
-    # 1) SDK object that exposes `embeddings` attribute
-    if hasattr(resp, "embeddings"):
-        try:
-            first = resp.embeddings[0]
-            # first might be a simple list/ndarray or an object with `.embedding`
-            if hasattr(first, "embedding"):
-                embedding = first.embedding
-            else:
-                embedding = first
-        except Exception:
-            embedding = None
+    # 1) resp.embeddings (SDK object)
+    try:
+        if hasattr(resp, "embeddings"):
+            emblist = resp.embeddings
+            if emblist and len(emblist) > 0:
+                candidate = emblist[0]
+    except Exception:
+        candidate = None
 
-    # 2) Some SDK versions return a dict-like response with 'embeddings' or 'data'
-    if embedding is None and isinstance(resp, dict):
+    # 2) dict-like with 'embeddings' or 'data'
+    if candidate is None and isinstance(resp, dict):
         for key in ("embeddings", "data", "results"):
             if key in resp and isinstance(resp[key], (list, tuple)) and len(resp[key]) > 0:
                 candidate = resp[key][0]
-                if isinstance(candidate, dict) and "embedding" in candidate:
-                    embedding = candidate["embedding"]
-                else:
-                    embedding = candidate
                 break
 
-    # 3) Some SDKs put useful info under `candidates` (generate-style responses)
-    if embedding is None and isinstance(resp, dict) and "candidates" in resp:
+    # 3) 'candidates' list (some SDK variants)
+    if candidate is None and isinstance(resp, dict) and "candidates" in resp:
         cand = resp["candidates"]
         if isinstance(cand, (list, tuple)) and len(cand) > 0:
-            cand0 = cand[0]
-            if isinstance(cand0, dict) and "embedding" in cand0:
-                embedding = cand0["embedding"]
+            if isinstance(cand[0], dict) and "embedding" in cand[0]:
+                candidate = cand[0]["embedding"]
+            else:
+                candidate = cand[0]
 
-    # 4) Fallback: try attributes commonly found on responses (for wrapped objects)
-    if embedding is None:
+    # 4) resp.data[0].embedding or resp.data
+    if candidate is None:
         try:
             data_attr = getattr(resp, "data", None)
             if data_attr and len(data_attr) > 0:
                 item0 = data_attr[0]
                 if hasattr(item0, "embedding"):
-                    embedding = item0.embedding
+                    candidate = item0.embedding
                 elif isinstance(item0, dict) and "embedding" in item0:
-                    embedding = item0["embedding"]
+                    candidate = item0["embedding"]
+                else:
+                    candidate = item0
         except Exception:
             pass
 
-    if embedding is None:
-        logger.error("Unable to parse embedding response. Response repr: %s", repr(resp))
+    # 5) fallback to resp itself
+    if candidate is None:
+        candidate = resp
+
+    numeric = _extract_numeric_from_obj(candidate)
+    if numeric is None:
+        logger.error("Unable to parse numeric embedding. Response repr: %s", repr(resp)[:2000])
         raise HTTPException(status_code=502, detail="Unexpected embedding response structure from upstream")
 
-    # Convert to numpy array of float32
-    vec = np.asarray(embedding, dtype=np.float32).reshape(-1)
+    # Convert to numpy array and normalize
+    try:
+        vec = np.asarray(numeric, dtype=np.float32).reshape(-1)
+    except Exception as e:
+        logger.exception("Failed to convert embedding to numpy array: %s", e)
+        raise HTTPException(status_code=502, detail="Invalid numeric embedding form")
 
-    # If zero-length or too small, error
     if vec.size == 0:
         logger.error("Received empty embedding vector")
         raise HTTPException(status_code=502, detail="Empty embedding returned by upstream")
 
-    # Normalize to unit length (cosine similarity)
     norm = np.linalg.norm(vec)
     if norm > 0:
         vec = vec / norm
 
     return vec
 
-# Simple top-k search against memmap embeddings
+# -------- Simple top-k search against memmap embeddings --------
 def top_k_search(query_vec: np.ndarray, k: int = 1):
     if embeddings is None:
         return []
@@ -426,7 +515,6 @@ def top_k_search(query_vec: np.ndarray, k: int = 1):
     chunk = 2048
     for i in range(0, num_pages, chunk):
         block = embeddings[i: i+chunk]
-        # ensure shapes align
         if block.shape[1] != q.shape[0]:
             logger.error("Embedding dim mismatch: block %s vs query %s", block.shape, q.shape)
             break
@@ -445,7 +533,7 @@ def top_k_search(query_vec: np.ndarray, k: int = 1):
         results.append((idx, float(best_scores[pos])))
     return results
 
-# Gemini generation using context snippets
+# -------- Gemini generation using context snippets --------
 def generate_answer_with_context(question: str, context_snippets: List[str]):
     if genai_client is None:
         logger.error("Generation client not available (genai_client is None)")
@@ -474,7 +562,6 @@ Give a short, factual answer based ONLY on the context above."""
             c = resp.candidates[0]
             text = getattr(c, "content", None) or getattr(c, "text", None)
         elif isinstance(resp, dict):
-            # dict-like response
             if "candidates" in resp and isinstance(resp["candidates"], (list, tuple)) and len(resp["candidates"])>0:
                 cand0 = resp["candidates"][0]
                 if isinstance(cand0, dict) and "content" in cand0:
@@ -490,7 +577,7 @@ Give a short, factual answer based ONLY on the context above."""
         raise HTTPException(status_code=502, detail="Upstream Gemini error")
     return str(text).strip()
 
-# Routes
+# -------- Routes --------
 @app.post("/api/ask", response_model=AskResponse)
 async def ask(req: AskRequest, key: str = Depends(verify_api_key)):
     start = time.time()
@@ -518,7 +605,7 @@ async def ask(req: AskRequest, key: str = Depends(verify_api_key)):
         return AskResponse(answer="No matching information found.", sources=[], retrieved=[], cached=False, response_time_seconds=time.time()-start)
 
     snippets = []
-    retrieved_objs = []
+    retrieved_objs: List[Source] = []
     for idx, score in results[:TOP_K]:
         p = pages[idx]
         snippets.append(p.get("snippet", "")[:2000])
@@ -538,13 +625,13 @@ async def ask(req: AskRequest, key: str = Depends(verify_api_key)):
 
 @app.get("/")
 async def home():
-    status_text = {"status": "online", "retriever": bool(retriever_enabled), "embed_model": EMBED_MODEL}
-    return status_text
+    return {"status": "online", "retriever": bool(retriever_enabled), "embed_model": EMBED_MODEL}
 
 @app.get("/favicon.ico")
 async def favicon():
     return Response(status_code=204)
 
+# -------- Run --------
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", 8000)), reload=False)
