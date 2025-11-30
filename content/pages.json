@@ -1,23 +1,22 @@
 [
   {
-    "id": "0",
-    "path": "documents.json",
-    "title": "documents",
-    "url": "",
-    "snippet": "[ \"What is RAG?\", \"RAG stands for Retrieval Augmented Generation.\", \"Chatbots can answer from custom knowledge.\" ]"
+    "id": 0,
+    "text": "https://scriptbees.com/what-is-the-job-of-an-immigration-consultant/ 2024-03-20T14:08:10+00:00 https://scriptbees.com/what-is-the-job-of-an-immigration-consultant-2/ 2024-03-20T14:06:44+00:00 https://scriptbees.com/what-is-the-job-of-an-immigration-consultant-3/ 2024-03-20T14:05:36+00:00 https://scriptbees.com/what-is-the-job-of-an-immigration-consultant-4/ 2024-03-20T14:03:48+00:00 https://scriptbees.com/what-is-the-job-of-an-immigration-consultant-5/ 2024-03-20T14:02:04+00:00 https://scriptbees.com/what-is-the-job-of-an-immigration-consultant-6/ 2024-03-20T13:59:27+00:00 https://scriptbees.com/what-is-the-job-of-an-immigration-consultant-7/ 2024-03-20T13:58:03+00:00 https://scriptbees.com/what-is-the-job-of-an-immigration-consultant-8/ 2024-03-20T13:56:10+00:00 https://scriptbees.com/what-is-the-job-of-an-immigration-consultant-9/ 2024-03-20T13:53:13+00:00 https://scriptbees.com/what-is-the-job-of-an-immigration-consultant-10/ 2024-03-20T13:51:14+00:00 https://scriptbees.com/what-is-the-job-of-an-immigration-consultant-11/ 2024-03-20T13:48:48+00:00 https://scriptbees.com/what-is-the-job-of-an-immigration-consultant-12/ 2024-03-20T14:09:56+00:00"
   },
   {
-    "id": "1",
-    "path": "pages.json",
-    "title": "pages",
-    "url": "",
-    "snippet": "[ { \"id\": \"0\", \"path\": \"documents.json\", \"title\": \"documents\", \"url\": \"\", \"snippet\": \"[ \\\"What is RAG?\\\", \\\"RAG stands for Retrieval Augmented Generation.\\\", \\\"Chatbots can answer from custom knowledge.\\\" ]\" }, { \"id\": \"1\", \"path\": \"pages.json\", \"title\": \"pages\", \"url\": \"\", \"snippet\": \"[ { \\\"url\\\": \\\"https://scriptbees.com/what-is-the-job-of-an-immigration-consultant/\\\", \\\"title\\\": \\\"Importance of Data Center Migration to Cloud – ScriptBees\\\", \\\"text\\\": \\\"Importance of Data Center Migration to Cloud – ScriptBees 0 Comments Managing the growing data has a big challenge for every company in the IT industry. Cloud computing is a significant help for organizations in running and managing databases. Many multinational companies have begun to adopt the cloud as a solution to manage workloads. The cloud is more feasible for organizations than the On-premise data centers. The cloud providers like AWS, Azure, and GCP enhance the agility and flexibility to provide more ease in data management. Cloud platforms are the best choice as they assure to run and manage the data seamlessly and transfer files between the applications. As per stats, in 2021, the global public cloud services market is expected to grow by approximately 18 percent, which amounts to 304 billion U.S. dollars. A few cloud providers are now capable of autoscale, which allows you to provision more services. Advantages of Cloud Migration Faster Deployment Times Enhanced Security Features Less Infrastructure Complexity Built-in Status Monitoring Improved Cost Management Types of Cloud Computing IaaS (Infrastructure as a Service) IaaS offers the necessary infrastructure to organizations based on pay-as-you-go instead of traditional data centers. However, as we discussed, the migration of infrastructure should happen since the current generation is dealing with the cloud. Specifically, infrastructure migration services include: Data Center Migration Physical-to-Physical(P2P) Physical-to-Virtual(P2V) Virtual-to-Virt"
+    "id": 1,
+    "text": "https://scriptbees.com/sample-page/ 2024-01-05T11:04:12+00:00 https://scriptbees.com/home-page-1/ 2024-01-05T11:11:58+00:00 https://scriptbees.com/home-page-2/ 2024-01-05T11:11:58+00:00 https://scriptbees.com/about/ 2024-12-20T04:54:58+00:00 https://scriptbees.com/services/ 2024-01-05T11:11:58+00:00 https://scriptbees.com/faq-page/ 2024-01-05T11:11:58+00:00 https://scriptbees.com/team-page/ 2024-01-05T11:11:58+00:00 https://scriptbees.com/pricing-page/ 2024-01-05T11:11:58+00:00 https://scriptbees.com/contact-page/ 2025-11-10T07:57:55+00:00 https://scriptbees.com/testimonial/ 2024-01-05T11:11:58+00:00 https://scriptbees.com/portfolio-page/ 2024-01-05T11:11:58+00:00 https://scriptbees.com/country-page/ 2024-01-05T11:11:58+00:00 https://scriptbees.com/country-page-two/ 2024-01-05T11:11:58+00:00 https://scriptbees.com/news/ 2024-03-11T16:34:02+00:00 https://scriptbees.com/blog/ 2024-03-20T14:18:02+00:00 https://scriptbees.com/job-page/ 2025-02-10T05:31:05+00:00 https://scriptbees.com/visa-page/ 2024-01-05T11:11:59+00:00 https://scriptbees.com/contact-page-2/ 2024-03-20T05:27:00+00:00 https://scriptbees.com/contact-page-3/ 2024-02-07T17:23:02+00:00 https://scriptbees.com/home-page-3/ 2024-01-05T11:11:59+00:00 https://scriptbees.com/home-page-4/ 2024-01-05T11:11:59+00:00 https://scriptbees.com/home-page-5/ 2024-01-05T11:11:59+00:00 https://scriptbees.com/ 2025-11-12T17:21:52+00:00 https://scriptbees.com/industries/ 2024-05-27T08:55:45+00:00 https://scriptbees.com/infrastructure-automation-2/ 2024-02-23T04:52:51+00:00 https://scriptbees.com/kubernetes-2/ 2025-11-03T12:08:19+00:00 https://scriptbees.com/test-automation-2/ 2024-02-23T06:17:34+00:00 https://scriptbees.com/rpa-services/ 2024-02-23T04:32:38+00:00 https://scriptbees.com/staff-augmentation/ 2024-02-23T04:26:30+00:00 https://scriptbees.com/enterprise-application/ 2024-12-04T10:09:09+00:00 https://scriptbees.com/process-manual/ 2024-05-27T06:05:31+00:00 https://scriptbees.com/technologies/ 2025-11-04T04:35:09+00:00 https://scriptbees.com/handbook/ 2025-02-04T06:48:34+00:00 https://scriptbees.com/news-2/ 2024-03-20T14:38:21+00:00 https://scriptbees.com/blog-2/ 2024-03-20T14:30:21+00:00 https://scriptbees.com/erp-service/ 2024-12-13T09:39:48+00:00 https://scriptbees.com/ai-services/ 2025-11-03T15:05:14+00:00 https://scriptbees.com/cloud-consulting/ 2025-11-03T13:23:50+00:00 https://scriptbees.com/data-engineering/ 2025-11-03T13:30:22+00:00 https://scriptbees.com/volunteermark/ 2025-11-17T03:04:16+00:00"
   },
   {
-    "id": "2",
-    "path": "pages_meta.json",
-    "title": "pages_meta",
-    "url": "",
-    "snippet": "[ { \"id\": 0, \"url\": \"https://scriptbees.com/wp-sitemap-posts-post-1.xml\", \"title\": \"https://scriptbees.com/wp-sitemap-posts-post-1.xml\" }, { \"id\": 1, \"url\": \"https://scriptbees.com/wp-sitemap-posts-page-1.xml\", \"title\": \"https://scriptbees.com/wp-sitemap-posts-page-1.xml\" }, { \"id\": 2, \"url\": \"https://scriptbees.com/wp-sitemap-taxonomies-category-1.xml\", \"title\": \"https://scriptbees.com/wp-sitemap-taxonomies-category-1.xml\" }, { \"id\": 3, \"url\": \"https://scriptbees.com/wp-sitemap-taxonomies-post_tag-1.xml\", \"title\": \"https://scriptbees.com/wp-sitemap-taxonomies-post_tag-1.xml\" }, { \"id\": 4, \"url\": \"https://scriptbees.com/wp-sitemap-users-1.xml\", \"title\": \"https://scriptbees.com/wp-sitemap-users-1.xml\" } ]"
+    "id": 2,
+    "text": "https://scriptbees.com/category/blog-2/ https://scriptbees.com/category/latest-news/"
+  },
+  {
+    "id": 3,
+    "text": "https://scriptbees.com/tag/business/ https://scriptbees.com/tag/construction/ https://scriptbees.com/tag/consulting/ https://scriptbees.com/tag/renovation/ https://scriptbees.com/tag/softeare/"
+  },
+  {
+    "id": 4,
+    "text": "https://scriptbees.com/author/scriptbees/"
   }
 ]
