@@ -1,20 +1,12 @@
 #!/usr/bin/env python3
 """
-main.py - Robust memmap Gemini server for ScriptBees (CLEAN)
+main.py - Robust memmap Gemini server for ScriptBees (UPDATED)
 
-Behavior:
-- Loads content/pages.json and content/embeddings.npy (memmap).
-- Attempts to auto-repair embeddings if the byte size can be reshaped to (n_pages, dim).
-- If repair impossible the retriever is disabled and /api/ask returns 503 with guidance.
-- Uses google-genai client via genai.Client().
-
-Requirements:
-- google-genai
-- fastapi
-- uvicorn
-- numpy
-- python-dotenv
-- pydantic
+Changes:
+- Uses genai_client.models.embed_content(...) instead of genai_client.embeddings.create(...)
+- Robust parsing of embedding responses across SDK versions
+- Auto-discovers a working embedding model at startup if EMBED_MODEL fails
+- Keeps original repair behavior for embeddings.npy
 """
 
 import os
@@ -26,12 +18,12 @@ import json
 import hashlib
 import logging
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 import numpy as np
 from dotenv import load_dotenv
 
-from fastapi import FastAPI, Depends, HTTPException, Security, Request, Response, status
+from fastapi import FastAPI, Depends, HTTPException, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field
@@ -97,7 +89,6 @@ class AskResponse(BaseModel):
 
 # API Key security
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
-
 def verify_api_key(req: Request, key: str = Depends(api_key_header)):
     incoming = key or ""
     if not incoming:
@@ -223,6 +214,120 @@ else:
     except Exception as e:
         logger.exception("Failed to create genai client: %s", e)
         genai_client = None
+
+# Auto-discover embedding model if configured model doesn't work
+def _auto_discover_embedding_model(client, configured_model: str) -> str:
+    global EMBED_MODEL
+    if client is None:
+        logger.warning("No genai client available for auto-discovery.")
+        return configured_model
+
+    # If user set a model, try it first
+    if configured_model:
+        try:
+            logger.info("Testing configured EMBED_MODEL='%s' ...", configured_model)
+            if hasattr(client, "models") and hasattr(client.models, "embed_content"):
+                client.models.embed_content(model=configured_model, contents=["test"])
+            elif hasattr(client, "embed") and hasattr(client.embed, "create"):
+                client.embed.create(model=configured_model, input="test")
+            else:
+                raise RuntimeError("No embed method available on client to test configured model.")
+            logger.info("Configured EMBED_MODEL '%s' appears to work.", configured_model)
+            return configured_model
+        except Exception as e:
+            logger.warning("Configured EMBED_MODEL '%s' failed test: %s", configured_model, getattr(e, "message", str(e)))
+            # fall through to discovery
+
+    # Try list models
+    raw = None
+    try:
+        logger.info("Listing models to discover embedding-capable model...")
+        if hasattr(client, "list_models"):
+            raw = client.list_models()
+            logger.info("Used client.list_models()")
+        elif hasattr(client, "models") and hasattr(client.models, "list"):
+            raw = client.models.list()
+            logger.info("Used client.models.list()")
+        else:
+            logger.warning("Client has no models.list/list_models API; skipping discovery.")
+            raw = None
+    except Exception as e:
+        logger.warning("List models call failed: %s", e)
+        raw = None
+
+    # Normalize raw into iterable items
+    items = []
+    try:
+        if raw is None:
+            items = []
+        elif isinstance(raw, dict) and "models" in raw:
+            items = raw["models"]
+        elif hasattr(raw, "__iter__") and not isinstance(raw, (str, bytes)):
+            items = list(raw)
+        else:
+            items = []
+    except Exception as e:
+        logger.warning("Failed to normalize models list: %s", e)
+        items = []
+
+    logger.info("Discovered %d model entries to inspect.", len(items))
+
+    # Heuristic: prefer model ids containing 'embed' or 'embedding'
+    candidates = []
+    for m in items:
+        try:
+            model_id = None
+            if isinstance(m, dict):
+                model_id = m.get("name") or m.get("id") or m.get("model")
+                supported = m.get("supported_methods") or m.get("capabilities") or m.get("methods") or []
+            else:
+                model_id = getattr(m, "name", None) or getattr(m, "id", None) or getattr(m, "model", None)
+                supported = getattr(m, "supported_methods", None) or getattr(m, "capabilities", None) or getattr(m, "methods", None) or []
+            supports_embed = False
+            if supported:
+                try:
+                    supports_embed = any("embed" in str(x).lower() for x in supported)
+                except Exception:
+                    supports_embed = False
+            if not supports_embed and model_id:
+                supports_embed = "embed" in model_id.lower() or "embedding" in model_id.lower()
+            if model_id:
+                candidates.append((model_id, supports_embed))
+        except Exception:
+            continue
+
+    # Order: explicit embed-capable first
+    ordered = [m for m, ok in candidates if ok] + [m for m, ok in candidates if not ok]
+
+    for candidate in ordered:
+        try:
+            logger.info("Trying candidate embedding model: %s", candidate)
+            if hasattr(client, "models") and hasattr(client.models, "embed_content"):
+                client.models.embed_content(model=candidate, contents=["hello world"])
+            elif hasattr(client, "embed") and hasattr(client.embed, "create"):
+                client.embed.create(model=candidate, input="hello world")
+            else:
+                logger.warning("Client lacks a known embed API to test candidates.")
+                break
+            EMBED_MODEL = candidate
+            logger.info("Auto-discovery selected EMBED_MODEL='%s'", candidate)
+            return candidate
+        except Exception as e:
+            logger.info("Candidate %s failed: %s", candidate, getattr(e, "message", str(e)))
+            continue
+
+    logger.warning("Auto-discovery failed to find a working embedding model; keeping EMBED_MODEL='%s'", configured_model)
+    return configured_model
+
+# Run auto-discovery at startup (updates in-memory EMBED_MODEL if successful)
+try:
+    resolved = _auto_discover_embedding_model(genai_client, EMBED_MODEL)
+    if resolved != EMBED_MODEL:
+        logger.info("Resolved EMBED_MODEL -> %s", resolved)
+    else:
+        logger.info("EMBED_MODEL remains -> %s", EMBED_MODEL)
+except Exception as e:
+    logger.warning("Auto-discovery encountered an exception: %s", e)
 
 # Helper: embed question using Gemini (clean, robust)
 def get_embedding_for_text(text: str) -> np.ndarray:
@@ -433,7 +538,7 @@ async def ask(req: AskRequest, key: str = Depends(verify_api_key)):
 
 @app.get("/")
 async def home():
-    status_text = {"status": "online", "retriever": bool(retriever_enabled)}
+    status_text = {"status": "online", "retriever": bool(retriever_enabled), "embed_model": EMBED_MODEL}
     return status_text
 
 @app.get("/favicon.ico")
