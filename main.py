@@ -1,14 +1,9 @@
+# scriptbees_gemini.py
 """
-SCRIPTBEES ASSISTANT - UPDATED
-- CORS configured from env (FRONTEND_ORIGINS)
-- If FRONTEND_ORIGINS='*' we disable credentials to avoid CORSMiddleware conflict
-- Safer OpenAI client init and error handling
-- Better logging and graceful failures when FAISS / models missing
-- Adds /favicon.ico 204 to avoid 404 noise
-- Middleware logs incoming paths to help debug double-slash issues
-- Ensures Source model construction avoids passing unexpected fields
+SCRIPTBEES ASSISTANT - Gemini (Google GenAI) version
+Replaces OpenAI client with google.genai client.
+Keep environment variable GEMINI_API_KEY (or use ADC).
 """
-
 import os
 import json
 import time
@@ -25,20 +20,10 @@ os.environ.pop("HTTPS_PROXY", None)
 os.environ.pop("http_proxy", None)
 os.environ.pop("https_proxy", None)
 
-import httpx
-from openai import OpenAI
-
-# Create safe HTTP client
-safe_http_client = httpx.Client(
-    timeout=40,
-    verify=True,
-)
-
 # ------------------------------
 # Load env (optionally from .env for local dev)
 # ------------------------------
 from dotenv import load_dotenv
-
 
 def find_env():
     cur = Path(__file__).resolve().parent
@@ -52,14 +37,11 @@ env = find_env()
 if env:
     load_dotenv(env)
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")  # preferred env var for Google GenAI API key
 API_KEY = os.getenv("RAG_API_KEY", "change-me")
 
-# FRONTEND_ORIGINS should be a comma-separated list of origins (including protocol),
-# e.g. https://frontend-qghcpai70-sharief44s-projects.vercel.app,https://example.com
-# If not provided, defaults to '*' (allow all) for quick debugging — change in production.
-_frontend_env = os.getenv("FRONTEND_ORIGINS", "*")
-_frontend_env = _frontend_env.strip()
+# FRONTEND_ORIGINS logic (unchanged)
+_frontend_env = os.getenv("FRONTEND_ORIGINS", "*").strip()
 if _frontend_env == "":
     FRONTEND_ORIGINS = ["*"]
 elif _frontend_env == "*":
@@ -67,9 +49,10 @@ elif _frontend_env == "*":
 else:
     FRONTEND_ORIGINS = [o.strip() for o in _frontend_env.split(",") if o.strip()]
 
-if not OPENAI_API_KEY:
-    # Stop on startup: it's better to fail early than run broken.
-    raise SystemExit("Missing OPENAI_API_KEY environment variable. Set OPENAI_API_KEY and redeploy.")
+# If you require an API key, enforce it (optional)
+# We allow running without GEMINI_API_KEY if using ADC; but if you want to require it, uncomment:
+# if not GEMINI_API_KEY:
+#     raise SystemExit("Missing GEMINI_API_KEY environment variable. Set GEMINI_API_KEY or configure ADC and redeploy.")
 
 # ------------------------------
 # Logging
@@ -81,8 +64,7 @@ logger = logging.getLogger("scriptbees")
 # Config
 # ------------------------------
 CONTENT_DIR = "content"
-MODEL_NAME = "all-MiniLM-L6-v2"
-
+MODEL_NAME = "gemini-2.5-flash"  # choose an available Gemini model; change if needed
 TOP_K = 1
 MAX_TOKENS = 150
 TEMPERATURE = 0.2
@@ -100,15 +82,10 @@ from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field
 from fastapi.responses import JSONResponse
 
-app = FastAPI(title="ScriptBees Assistant — Final Version")
+app = FastAPI(title="ScriptBees Assistant — Gemini Version")
 
-# Determine cors kwargs safely
-_allow_credentials = True
-if FRONTEND_ORIGINS == ["*"]:
-    # FastAPI's CORSMiddleware will raise if allow_origins==["*"] and allow_credentials==True
-    _allow_credentials = False
+_allow_credentials = True if FRONTEND_ORIGINS != ["*"] else False
 
-# Add CORS middleware immediately after app creation
 app.add_middleware(
     CORSMiddleware,
     allow_origins=FRONTEND_ORIGINS,
@@ -142,15 +119,12 @@ api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
 def verify_api_key(req: Request, key: str = Security(api_key_header)):
     incoming = key or ""
-
     if not incoming:
         auth = req.headers.get("authorization", "")
         if auth and auth.lower().startswith("bearer "):
             incoming = auth.split(" ", 1)[1]
-
     if incoming != API_KEY:
         raise HTTPException(status_code=403, detail="Invalid API key")
-
     return incoming
 
 # ------------------------------
@@ -160,7 +134,7 @@ cache = {}
 def ckey(q): return hashlib.md5(q.lower().encode()).hexdigest()
 
 # ------------------------------
-# Startup: Load FAISS + Model
+# Startup: Load FAISS + Model + Gemeni client
 # ------------------------------
 retriever = None
 generator = None
@@ -168,8 +142,7 @@ generator = None
 @app.on_event("startup")
 async def startup():
     global retriever, generator
-
-    logger.info("🚀 Starting ScriptBees AI Assistant...")
+    logger.info("🚀 Starting ScriptBees AI Assistant (Gemini)...")
 
     try:
         import faiss
@@ -178,12 +151,10 @@ async def startup():
         logger.exception("Failed to import FAISS / sentence_transformers. Make sure dependencies are installed.")
         raise SystemExit("Missing FAISS or sentence-transformers dependencies: " + str(e))
 
-    # Retriever
+    # Retriever (unchanged logic)
     class Retriever:
         def __init__(self):
             logger.info("📦 Loading FAISS + metadata...")
-
-            # validate files up-front for clearer errors
             if not Path(INDEX_PATH).exists():
                 raise SystemExit(f"Missing FAISS index at {INDEX_PATH}")
             if not Path(META_PATH).exists():
@@ -191,30 +162,25 @@ async def startup():
             if not Path(PAGES_PATH).exists():
                 raise SystemExit(f"Missing pages file at {PAGES_PATH}")
 
-            self.model = SentenceTransformer(MODEL_NAME)
+            self.model = SentenceTransformer("all-MiniLM-L6-v2")
             self.index = faiss.read_index(INDEX_PATH)
 
             with open(META_PATH, "r") as f:
                 self.meta = json.load(f)
-
             with open(PAGES_PATH, "r") as f:
                 pages = json.load(f)
-
             self.pages = {p["id"]: p for p in pages}
-
             logger.info(f"✓ Loaded {getattr(self.index, 'ntotal', 'unknown')} ScriptBees pages")
 
         def retrieve(self, question):
             vec = self.model.encode([question], normalize_embeddings=True).astype("float32")
             scores, idxs = self.index.search(vec, TOP_K)
-
             results = []
             for s, idx in zip(scores[0], idxs[0]):
                 if idx == -1:
                     continue
                 meta = self.meta[idx]
                 page = self.pages.get(meta["id"], {})
-
                 results.append({
                     "url": meta.get("url", ""),
                     "title": meta.get("title", ""),
@@ -223,78 +189,76 @@ async def startup():
                 })
             return results
 
-    # Generator
+    # Generator using Google GenAI (Gemini)
     class LLMGenerator:
         def __init__(self):
-            # initialize OpenAI client with the safe httpx client
-            self.client = OpenAI(api_key=OPENAI_API_KEY, http_client=safe_http_client)
+            # Use google.genai client. If GEMINI_API_KEY present we use it,
+            # otherwise client will fallback to ADC if configured on the environment.
+            try:
+                # google-genai library
+                from google import genai
+            except Exception as e:
+                logger.exception("google.genai client not installed. Install 'google-genai' package.")
+                raise SystemExit("Missing google-genai library: " + str(e))
+
+            if GEMINI_API_KEY:
+                self.client = genai.Client(api_key=GEMINI_API_KEY)
+            else:
+                # fallback to ADC (Application Default Credentials)
+                self.client = genai.Client()
 
         def generate(self, question, docs):
             context = docs[0]["text"]
-
-            prompt = f"""
-You are ScriptBees AI Assistant.
-
+            prompt = f"""You are ScriptBees AI Assistant.
 Answer ONLY using this ScriptBees content:
-
 {context}
 
 Question: {question}
 
-Give a short and correct answer based ONLY on ScriptBees website.
-"""
+Give a short and correct answer based ONLY on ScriptBees website."""
             try:
-                res = self.client.chat.completions.create(
-                    model="gpt-4o-mini",
-                    messages=[{"role": "user", "content": prompt}],
-                    max_tokens=MAX_TOKENS,
-                    temperature=TEMPERATURE
+                # model selection: change MODEL_NAME if you prefer a different Gemini model
+                resp = self.client.models.generate_content(
+                    model=MODEL_NAME,
+                    contents=[prompt],
+                    max_output_tokens=MAX_TOKENS
                 )
             except Exception as e:
-                # Map common OpenAI errors to cleaner HTTPExceptions
                 msg = str(e)
-                logger.exception("OpenAI request failed")
-                if "401" in msg or "invalid_api_key" in msg.lower():
-                    raise HTTPException(status_code=502, detail="Upstream OpenAI authentication error")
+                logger.exception("Gemini (Google GenAI) request failed")
+                if "401" in msg or "unauthorized" in msg.lower():
+                    raise HTTPException(status_code=502, detail="Upstream Gemini authentication error")
                 if "429" in msg or "rate limit" in msg.lower():
-                    raise HTTPException(status_code=429, detail="Upstream OpenAI rate limit")
-                raise HTTPException(status_code=502, detail=f"Upstream OpenAI error: {msg}")
+                    raise HTTPException(status_code=429, detail="Upstream Gemini rate limit")
+                raise HTTPException(status_code=502, detail=f"Upstream Gemini error: {msg}")
 
-            # Extract answer robustly
+            # Extract text
             answer_text = ""
             try:
-                choices = getattr(res, "choices", None) or res.get("choices", None)
-                if choices and len(choices) > 0:
-                    choice = choices[0]
-                    message = getattr(choice, "message", None) or choice.get("message", None)
-                    if isinstance(message, dict):
-                        answer_text = message.get("content", "").strip()
-                    else:
-                        answer_text = getattr(message, "content", "").strip()
+                # response typically has .text or choices; guard both ways
+                answer_text = getattr(resp, "text", None) or resp.get("candidates", [{}])[0].get("content", "")
+                if isinstance(answer_text, dict):
+                    # some responses may nest it
+                    answer_text = answer_text.get("text", "") or str(answer_text)
+                answer_text = str(answer_text).strip()
             except Exception:
-                logger.exception("Failed to parse OpenAI response")
+                logger.exception("Failed to parse Gemini response")
 
             if not answer_text:
                 answer_text = "No answer returned from upstream."
-
             return answer_text
 
     retriever = Retriever()
     generator = LLMGenerator()
+    logger.info("✅ ScriptBees Assistant (Gemini) is READY")
 
-    logger.info("✅ ScriptBees Assistant is READY")
-
-# ------------------------------
-# Small middleware to log incoming path (helps debug double-slash issues)
-# ------------------------------
+# middleware to log incoming path (helps debug double-slash issues)
 @app.middleware("http")
 async def log_path(request: Request, call_next):
     logger.info("Incoming request: %s %s", request.method, request.url.path)
     return await call_next(request)
 
-# ------------------------------
 # API Route
-# ------------------------------
 @app.post("/api/ask", response_model=AskResponse)
 async def ask(req: AskRequest, key: str = Depends(verify_api_key)):
     start = time.time()
@@ -319,7 +283,6 @@ async def ask(req: AskRequest, key: str = Depends(verify_api_key)):
 
     answer = generator.generate(req.question, docs)
 
-    # Build Source objects explicitly to avoid passing unexpected extra fields
     first = docs[0]
     source_obj = Source(url=first.get("url", ""), title=first.get("title", ""), score=first.get("score", 0.0))
 
@@ -336,16 +299,12 @@ async def ask(req: AskRequest, key: str = Depends(verify_api_key)):
 
 @app.get("/")
 async def home():
-    return {"status": "online", "bot": "ScriptBees AI"}
+    return {"status": "online", "bot": "ScriptBees AI (Gemini)"}
 
-# Add a small favicon route so the logs don't fill with 404s
 @app.get("/favicon.ico")
 async def favicon():
     return Response(status_code=204)
 
-# ------------------------------
-# Run Local
-# ------------------------------
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)

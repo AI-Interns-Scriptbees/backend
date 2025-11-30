@@ -26,5 +26,5 @@ torch==2.0.1
 tqdm==4.66.4
 
 huggingface_hub==0.25.2
-openai==1.44.0
 
+google-genai
