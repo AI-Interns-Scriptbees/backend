@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
 """
-main.py - Lightweight ScriptBees Gemini memmap server suitable for 512MB Render.
+main.py - Robust memmap Gemini server for ScriptBees (REPAIR + tolerant mode)
 
-Requirements (on Render):
-  - google-genai
-  - fastapi
-  - uvicorn
-  - numpy
-  - python-dotenv
-  - httpx (optional)
-  - pydantic
+Behavior improvements vs prior:
+- Attempts to auto-repair embeddings.npy if its byte size can be reshaped to (n_pages, dim).
+- If repair impossible, server starts with retriever disabled and /api/ask returns 503 with a message.
+- All original behavior otherwise preserved.
+
+Requirements (same as before):
+- google-genai
+- fastapi
+- uvicorn
+- numpy
+- python-dotenv
+- pydantic
 """
 
 import os
@@ -21,12 +25,12 @@ import json
 import hashlib
 import logging
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 import numpy as np
 from dotenv import load_dotenv
 
-from fastapi import FastAPI, Depends, HTTPException, Security, Request, Response
+from fastapi import FastAPI, Depends, HTTPException, Security, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field
@@ -50,9 +54,9 @@ env = find_env()
 if env:
     load_dotenv(env)
 
-# Config from env
+# Config from env (defaults)
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-API_KEY = os.getenv("RAG_APIKey".upper(), os.getenv("RAG_API_KEY", "change-me"))  # support both RAG_API_KEY or rag_api_key
+API_KEY = os.getenv("RAG_API_KEY", "change-me")
 FRONTEND_ORIGINS = os.getenv("FRONTEND_ORIGINS", "*")
 EMBED_MODEL = os.getenv("EMBED_MODEL", "embed-gecko-001")
 GEN_MODEL = os.getenv("GEN_MODEL", "gemini-2.5-mini")
@@ -66,10 +70,10 @@ EMBED_FILE = CONTENT_DIR / "embeddings.npy"
 
 # Logging
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("scriptbees-memmap")
+logger = logging.getLogger("scriptbees-memmap-robust")
 
 # FastAPI app & CORS
-app = FastAPI(title="ScriptBees — small memmap Gemini")
+app = FastAPI(title="ScriptBees — Gemini Memmap (Robust)")
 _allow_credentials = False if FRONTEND_ORIGINS.strip() == "*" else True
 origins = [o.strip() for o in FRONTEND_ORIGINS.split(",")] if FRONTEND_ORIGINS != "*" else ["*"]
 app.add_middleware(CORSMiddleware, allow_origins=origins, allow_credentials=_allow_credentials, allow_methods=["*"], allow_headers=["*"])
@@ -92,7 +96,7 @@ class AskResponse(BaseModel):
 
 # API Key security
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
-def verify_api_key(req: Request, key: str = Security(api_key_header)):
+def verify_api_key(req: Request, key: str = Depends(api_key_header)):
     incoming = key or ""
     if not incoming:
         auth = req.headers.get("authorization", "")
@@ -106,47 +110,119 @@ def verify_api_key(req: Request, key: str = Security(api_key_header)):
 def ckey(q): return hashlib.md5(q.lower().encode()).hexdigest()
 cache = {}
 
-# Load pages metadata (small)
-if not PAGES_FILE.exists() or not EMBED_FILE.exists():
-    logger.error("Missing content files. Ensure content/pages.json and content/embeddings.npy exist.")
-    raise SystemExit("Missing content files. Run precompute/embedder script first.")
+# Globals for retriever
+pages = []
+embeddings = None   # numpy memmap or ndarray
+emb_dim = 0
+num_pages = 0
+retriever_enabled = False
 
-with open(PAGES_FILE, "r", encoding="utf-8") as f:
-    pages = json.load(f)
-num_pages = len(pages)
+# Utility: attempt to load pages.json
+def load_pages():
+    global pages, num_pages
+    if not PAGES_FILE.exists():
+        logger.error("Missing pages.json at %s", PAGES_FILE)
+        return False
+    with open(PAGES_FILE, "r", encoding="utf-8") as f:
+        pages = json.load(f)
+    num_pages = len(pages)
+    logger.info("Loaded %d pages from %s", num_pages, PAGES_FILE)
+    return True
 
-# Memmap loader robustly determines shape
-def load_memmap_embeddings(path: Path, n_rows: int):
-    # Try to load with -1 dim; numpy memmap requires known shape, so try to infer dim
-    # Load header-less to infer size
-    # Approach: load raw file size and deduce dimension
-    import os as _os
-    size_bytes = _os.path.getsize(str(path))
-    # float32 => 4 bytes
+# Utility: try robustly load embeddings memmap or repair if possible
+def try_load_or_repair_embeddings():
+    global embeddings, emb_dim, retriever_enabled
+    if not EMBED_FILE.exists():
+        logger.error("Missing embeddings.npy at %s", EMBED_FILE)
+        return False
+
+    # Quick checks by file size
+    size_bytes = EMBED_FILE.stat().st_size
+    if size_bytes % 4 != 0:
+        logger.error("Embeddings file size (%d) not divisible by 4 -> not float32", size_bytes)
+        return False
     total_floats = size_bytes // 4
-    if total_floats % n_rows != 0:
-        raise RuntimeError("Embeddings file size incompatible with number of pages.")
-    dim = total_floats // n_rows
-    mm = np.memmap(str(path), dtype=np.float32, mode="r", shape=(n_rows, dim))
-    return mm
+    if num_pages <= 0:
+        logger.error("num_pages is zero; cannot shape embeddings")
+        return False
 
-embeddings = load_memmap_embeddings(EMBED_FILE, num_pages)
-emb_dim = embeddings.shape[1]
-logger.info(f"Loaded {num_pages} pages, embedding dim {emb_dim} (memmap)")
+    if total_floats % num_pages == 0:
+        dim = total_floats // num_pages
+        logger.info("Inferred embeddings shape: (%d, %d)", num_pages, dim)
+        # Try memmap load as (num_pages, dim)
+        try:
+            mm = np.memmap(str(EMBED_FILE), dtype=np.float32, mode="r", shape=(num_pages, dim))
+            # basic sanity: check NaNs
+            sample = mm[0]
+            if np.isnan(sample).any():
+                logger.warning("Embeddings contain NaNs in sample row.")
+            embeddings = mm
+            emb_dim = dim
+            retriever_enabled = True
+            logger.info("Loaded embeddings memmap with shape (%d,%d)", num_pages, emb_dim)
+            return True
+        except Exception as e:
+            logger.warning("Memmap load failed for shape (%d,%d): %s", num_pages, dim, e)
+            # try fallback: load full array and reshape
+            try:
+                arr = np.load(str(EMBED_FILE), mmap_mode="r")
+                arr = np.asarray(arr, dtype=np.float32)
+                if arr.ndim == 1:
+                    arr = arr.reshape((num_pages, dim))
+                elif arr.ndim == 2 and arr.shape[0] == num_pages and arr.shape[1] == dim:
+                    pass
+                else:
+                    logger.warning("Loaded array shape %s not matching expected (%d,%d)", arr.shape, num_pages, dim)
+                    return False
+                # save a memmap-style .npy (overwrite safe path embeddings_repaired.npy then rename)
+                repaired = str(EMBED_FILE.parent / "embeddings_repaired.npy")
+                np.save(repaired, arr.astype(np.float32))
+                # replace original
+                os.replace(repaired, str(EMBED_FILE))
+                # load memmap fresh
+                mm2 = np.memmap(str(EMBED_FILE), dtype=np.float32, mode="r", shape=(num_pages, dim))
+                embeddings = mm2
+                emb_dim = dim
+                retriever_enabled = True
+                logger.info("Repaired and loaded embeddings memmap (%d,%d)", num_pages, emb_dim)
+                return True
+            except Exception as e2:
+                logger.exception("Failed fallback reshape & load: %s", e2)
+                return False
+    else:
+        # cannot reshape cleanly
+        logger.error("Total floats (%d) not divisible by num_pages (%d) -> cannot reshape", total_floats, num_pages)
+        return False
 
-# Create genai client
-if genai is None:
-    raise SystemExit("google-genai client not installed. pip install google-genai")
-
-if GEMINI_API_KEY:
-    genai_client = genai.Client(api_key=GEMINI_API_KEY)
+# Startup: load pages + embeddings (try repair)
+logger.info("Starting ScriptBees memmap server (robust startup)...")
+_pages_ok = load_pages()
+if _pages_ok:
+    ok = try_load_or_repair_embeddings()
+    if ok:
+        logger.info("Retriever enabled.")
+    else:
+        retriever_enabled = False
+        logger.warning("Retriever disabled due to embeddings/pages mismatch. App will start but /api/ask returns 503 until fixed.")
 else:
-    genai_client = genai.Client()
+    retriever_enabled = False
+    logger.warning("Pages not loaded. Retriever disabled. Ensure content/pages.json exists.")
 
-# Helpers
+# Create genai client (even if retriever disabled we keep client init)
+if genai is None:
+    logger.warning("google-genai client not installed. Gemini features will fail if invoked.")
+    genai_client = None
+else:
+    if GEMINI_API_KEY:
+        genai_client = genai.Client(api_key=GEMINI_API_KEY)
+    else:
+        genai_client = genai.Client()
+
+# Helper: embed question using Gemini
 def get_embedding_for_text(text: str):
+    if genai_client is None:
+        raise HTTPException(status_code=502, detail="Embedding client not available")
     resp = genai_client.embeddings.create(model=EMBED_MODEL, input=text)
-    # parse robustly
     if hasattr(resp, "data"):
         vec = resp.data[0].embedding
     else:
@@ -157,17 +233,17 @@ def get_embedding_for_text(text: str):
         arr = arr / norm
     return arr
 
+# Simple top-k search against memmap embeddings
 def top_k_search(query_vec: np.ndarray, k: int = 1):
+    if embeddings is None:
+        return []
     q = query_vec.reshape(-1)
     best_scores = np.full(k, -np.inf, dtype=np.float32)
     best_idxs = np.full(k, -1, dtype=np.int32)
-    # chunk to avoid large RAM spikes
     chunk = 2048
     for i in range(0, num_pages, chunk):
-        block = embeddings[i: i+chunk]   # memmap slice
-        # block assumed normalized on precompute; otherwise normalize here
+        block = embeddings[i: i+chunk]
         dots = block.dot(q)
-        # update best
         for j, score in enumerate(dots):
             if score > best_scores.min():
                 pos = int(best_scores.argmin())
@@ -182,8 +258,10 @@ def top_k_search(query_vec: np.ndarray, k: int = 1):
         results.append((idx, float(best_scores[pos])))
     return results
 
+# Gemini generation using context snippets
 def generate_answer_with_context(question: str, context_snippets: List[str]):
-    # Combine snippets but cap total length to avoid giant prompts
+    if genai_client is None:
+        raise HTTPException(status_code=502, detail="Generation client not available")
     context = "\n\n".join(context_snippets)[:8000]
     prompt = f"""You are ScriptBees Assistant. Use ONLY the content provided to answer the question.
 
@@ -200,13 +278,10 @@ Give a short, factual answer based ONLY on the context above."""
             max_output_tokens=MAX_TOKENS,
             temperature=TEMPERATURE
         )
-        # robust extraction
         text = getattr(resp, "text", None)
         if not text:
-            # may be dict-like
             candidates = getattr(resp, "candidates", None) or (resp.get("candidates") if isinstance(resp, dict) else None)
             if candidates and len(candidates) > 0:
-                # some SDKs return 'content' inside candidate
                 text = candidates[0].get("content") if isinstance(candidates[0], dict) else getattr(candidates[0], "content", None)
         if isinstance(text, dict):
             text = text.get("text", "") or str(text)
@@ -221,6 +296,13 @@ Give a short, factual answer based ONLY on the context above."""
 @app.post("/api/ask", response_model=AskResponse)
 async def ask(req: AskRequest, key: str = Depends(verify_api_key)):
     start = time.time()
+    if not retriever_enabled:
+        # give a helpful error with guidance
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Retriever not available. Ensure content/pages.json and content/embeddings.npy exist and match. See logs."
+        )
+
     h = ckey(req.question)
     if h in cache:
         r = cache[h]
@@ -228,8 +310,8 @@ async def ask(req: AskRequest, key: str = Depends(verify_api_key)):
         r["response_time_seconds"] = time.time() - start
         return r
 
+    # embed question and search
     q_emb = get_embedding_for_text(req.question)
-    # ensure normalized
     q_norm = np.linalg.norm(q_emb)
     if q_norm > 0:
         q_emb = q_emb / q_norm
@@ -238,7 +320,6 @@ async def ask(req: AskRequest, key: str = Depends(verify_api_key)):
     if not results:
         return AskResponse(answer="No matching information found.", sources=[], retrieved=[], cached=False, response_time_seconds=time.time()-start)
 
-    # collect top snippets (may be multiple if TOP_K > 1)
     snippets = []
     retrieved_objs = []
     for idx, score in results[:TOP_K]:
@@ -259,14 +340,14 @@ async def ask(req: AskRequest, key: str = Depends(verify_api_key)):
     return resp
 
 @app.get("/")
-async def health():
-    return {"status": "online", "mode": "gemini-memmap"}
+async def home():
+    status_text = {"status": "online", "retriever": bool(retriever_enabled)}
+    return status_text
 
 @app.get("/favicon.ico")
 async def favicon():
     return Response(status_code=204)
 
-# local run
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", 8000)), reload=False)
