@@ -1,33 +1,46 @@
-# scriptbees_gemini.py
+#!/usr/bin/env python3
 """
-SCRIPTBEES ASSISTANT - Gemini (Google GenAI) version
-Replaces OpenAI client with google.genai client.
-Keep environment variable GEMINI_API_KEY (or use ADC).
+main.py - Lightweight ScriptBees Gemini memmap server suitable for 512MB Render.
+
+Requirements (on Render):
+  - google-genai
+  - fastapi
+  - uvicorn
+  - numpy
+  - python-dotenv
+  - httpx (optional)
+  - pydantic
 """
+
 import os
-import json
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+
 import time
-import logging
+import json
 import hashlib
-from typing import List
+import logging
 from pathlib import Path
+from typing import List
 
-# ------------------------------
-# Remove proxy variables (Render injects these)
-# ------------------------------
-os.environ.pop("HTTP_PROXY", None)
-os.environ.pop("HTTPS_PROXY", None)
-os.environ.pop("http_proxy", None)
-os.environ.pop("https_proxy", None)
-
-# ------------------------------
-# Load env (optionally from .env for local dev)
-# ------------------------------
+import numpy as np
 from dotenv import load_dotenv
 
+from fastapi import FastAPI, Depends, HTTPException, Security, Request, Response
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import APIKeyHeader
+from pydantic import BaseModel, Field
+
+# GenAI client
+try:
+    from google import genai
+except Exception:
+    genai = None
+
+# Load .env if present (local dev)
 def find_env():
     cur = Path(__file__).resolve().parent
-    for _ in range(10):
+    for _ in range(5):
         if (cur / ".env").exists():
             return cur / ".env"
         cur = cur.parent
@@ -37,66 +50,31 @@ env = find_env()
 if env:
     load_dotenv(env)
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")  # preferred env var for Google GenAI API key
-API_KEY = os.getenv("RAG_API_KEY", "change-me")
+# Config from env
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+API_KEY = os.getenv("RAG_APIKey".upper(), os.getenv("RAG_API_KEY", "change-me"))  # support both RAG_API_KEY or rag_api_key
+FRONTEND_ORIGINS = os.getenv("FRONTEND_ORIGINS", "*")
+EMBED_MODEL = os.getenv("EMBED_MODEL", "embed-gecko-001")
+GEN_MODEL = os.getenv("GEN_MODEL", "gemini-2.5-mini")
+TOP_K = int(os.getenv("TOP_K", "1"))
+MAX_TOKENS = int(os.getenv("MAX_TOKENS", "150"))
+TEMPERATURE = float(os.getenv("TEMPERATURE", "0.2"))
 
-# FRONTEND_ORIGINS logic (unchanged)
-_frontend_env = os.getenv("FRONTEND_ORIGINS", "*").strip()
-if _frontend_env == "":
-    FRONTEND_ORIGINS = ["*"]
-elif _frontend_env == "*":
-    FRONTEND_ORIGINS = ["*"]
-else:
-    FRONTEND_ORIGINS = [o.strip() for o in _frontend_env.split(",") if o.strip()]
+CONTENT_DIR = Path("content")
+PAGES_FILE = CONTENT_DIR / "pages.json"
+EMBED_FILE = CONTENT_DIR / "embeddings.npy"
 
-# If you require an API key, enforce it (optional)
-# We allow running without GEMINI_API_KEY if using ADC; but if you want to require it, uncomment:
-# if not GEMINI_API_KEY:
-#     raise SystemExit("Missing GEMINI_API_KEY environment variable. Set GEMINI_API_KEY or configure ADC and redeploy.")
-
-# ------------------------------
 # Logging
-# ------------------------------
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("scriptbees")
+logger = logging.getLogger("scriptbees-memmap")
 
-# ------------------------------
-# Config
-# ------------------------------
-CONTENT_DIR = "content"
-MODEL_NAME = "gemini-2.5-flash"  # choose an available Gemini model; change if needed
-TOP_K = 1
-MAX_TOKENS = 150
-TEMPERATURE = 0.2
+# FastAPI app & CORS
+app = FastAPI(title="ScriptBees — small memmap Gemini")
+_allow_credentials = False if FRONTEND_ORIGINS.strip() == "*" else True
+origins = [o.strip() for o in FRONTEND_ORIGINS.split(",")] if FRONTEND_ORIGINS != "*" else ["*"]
+app.add_middleware(CORSMiddleware, allow_origins=origins, allow_credentials=_allow_credentials, allow_methods=["*"], allow_headers=["*"])
 
-INDEX_PATH = f"{CONTENT_DIR}/pages.faiss"
-META_PATH = f"{CONTENT_DIR}/pages_meta.json"
-PAGES_PATH = f"{CONTENT_DIR}/pages.json"
-
-# ------------------------------
-# FastAPI App
-# ------------------------------
-from fastapi import FastAPI, Depends, HTTPException, Security, Request, Response
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.security import APIKeyHeader
-from pydantic import BaseModel, Field
-from fastapi.responses import JSONResponse
-
-app = FastAPI(title="ScriptBees Assistant — Gemini Version")
-
-_allow_credentials = True if FRONTEND_ORIGINS != ["*"] else False
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=FRONTEND_ORIGINS,
-    allow_credentials=_allow_credentials,
-    allow_methods=["GET", "POST", "OPTIONS", "PUT", "DELETE", "PATCH"],
-    allow_headers=["*"],
-)
-
-# ------------------------------
 # Models
-# ------------------------------
 class AskRequest(BaseModel):
     question: str = Field(..., min_length=1)
 
@@ -112,11 +90,8 @@ class AskResponse(BaseModel):
     cached: bool
     response_time_seconds: float
 
-# ------------------------------
-# API Key Security
-# ------------------------------
+# API Key security
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
-
 def verify_api_key(req: Request, key: str = Security(api_key_header)):
     incoming = key or ""
     if not incoming:
@@ -127,143 +102,125 @@ def verify_api_key(req: Request, key: str = Security(api_key_header)):
         raise HTTPException(status_code=403, detail="Invalid API key")
     return incoming
 
-# ------------------------------
-# Cache
-# ------------------------------
-cache = {}
+# Cache util
 def ckey(q): return hashlib.md5(q.lower().encode()).hexdigest()
+cache = {}
 
-# ------------------------------
-# Startup: Load FAISS + Model + Gemeni client
-# ------------------------------
-retriever = None
-generator = None
+# Load pages metadata (small)
+if not PAGES_FILE.exists() or not EMBED_FILE.exists():
+    logger.error("Missing content files. Ensure content/pages.json and content/embeddings.npy exist.")
+    raise SystemExit("Missing content files. Run precompute/embedder script first.")
 
-@app.on_event("startup")
-async def startup():
-    global retriever, generator
-    logger.info("🚀 Starting ScriptBees AI Assistant (Gemini)...")
+with open(PAGES_FILE, "r", encoding="utf-8") as f:
+    pages = json.load(f)
+num_pages = len(pages)
 
-    try:
-        import faiss
-        from sentence_transformers import SentenceTransformer
-    except Exception as e:
-        logger.exception("Failed to import FAISS / sentence_transformers. Make sure dependencies are installed.")
-        raise SystemExit("Missing FAISS or sentence-transformers dependencies: " + str(e))
+# Memmap loader robustly determines shape
+def load_memmap_embeddings(path: Path, n_rows: int):
+    # Try to load with -1 dim; numpy memmap requires known shape, so try to infer dim
+    # Load header-less to infer size
+    # Approach: load raw file size and deduce dimension
+    import os as _os
+    size_bytes = _os.path.getsize(str(path))
+    # float32 => 4 bytes
+    total_floats = size_bytes // 4
+    if total_floats % n_rows != 0:
+        raise RuntimeError("Embeddings file size incompatible with number of pages.")
+    dim = total_floats // n_rows
+    mm = np.memmap(str(path), dtype=np.float32, mode="r", shape=(n_rows, dim))
+    return mm
 
-    # Retriever (unchanged logic)
-    class Retriever:
-        def __init__(self):
-            logger.info("📦 Loading FAISS + metadata...")
-            if not Path(INDEX_PATH).exists():
-                raise SystemExit(f"Missing FAISS index at {INDEX_PATH}")
-            if not Path(META_PATH).exists():
-                raise SystemExit(f"Missing metadata file at {META_PATH}")
-            if not Path(PAGES_PATH).exists():
-                raise SystemExit(f"Missing pages file at {PAGES_PATH}")
+embeddings = load_memmap_embeddings(EMBED_FILE, num_pages)
+emb_dim = embeddings.shape[1]
+logger.info(f"Loaded {num_pages} pages, embedding dim {emb_dim} (memmap)")
 
-            self.model = SentenceTransformer("all-MiniLM-L6-v2")
-            self.index = faiss.read_index(INDEX_PATH)
+# Create genai client
+if genai is None:
+    raise SystemExit("google-genai client not installed. pip install google-genai")
 
-            with open(META_PATH, "r") as f:
-                self.meta = json.load(f)
-            with open(PAGES_PATH, "r") as f:
-                pages = json.load(f)
-            self.pages = {p["id"]: p for p in pages}
-            logger.info(f"✓ Loaded {getattr(self.index, 'ntotal', 'unknown')} ScriptBees pages")
+if GEMINI_API_KEY:
+    genai_client = genai.Client(api_key=GEMINI_API_KEY)
+else:
+    genai_client = genai.Client()
 
-        def retrieve(self, question):
-            vec = self.model.encode([question], normalize_embeddings=True).astype("float32")
-            scores, idxs = self.index.search(vec, TOP_K)
-            results = []
-            for s, idx in zip(scores[0], idxs[0]):
-                if idx == -1:
-                    continue
-                meta = self.meta[idx]
-                page = self.pages.get(meta["id"], {})
-                results.append({
-                    "url": meta.get("url", ""),
-                    "title": meta.get("title", ""),
-                    "score": float(s),
-                    "text": page.get("text", "")[:1200]
-                })
-            return results
+# Helpers
+def get_embedding_for_text(text: str):
+    resp = genai_client.embeddings.create(model=EMBED_MODEL, input=text)
+    # parse robustly
+    if hasattr(resp, "data"):
+        vec = resp.data[0].embedding
+    else:
+        vec = resp.get("data", [])[0].get("embedding")
+    arr = np.array(vec, dtype=np.float32)
+    norm = np.linalg.norm(arr)
+    if norm > 0:
+        arr = arr / norm
+    return arr
 
-    # Generator using Google GenAI (Gemini)
-    class LLMGenerator:
-        def __init__(self):
-            # Use google.genai client. If GEMINI_API_KEY present we use it,
-            # otherwise client will fallback to ADC if configured on the environment.
-            try:
-                # google-genai library
-                from google import genai
-            except Exception as e:
-                logger.exception("google.genai client not installed. Install 'google-genai' package.")
-                raise SystemExit("Missing google-genai library: " + str(e))
+def top_k_search(query_vec: np.ndarray, k: int = 1):
+    q = query_vec.reshape(-1)
+    best_scores = np.full(k, -np.inf, dtype=np.float32)
+    best_idxs = np.full(k, -1, dtype=np.int32)
+    # chunk to avoid large RAM spikes
+    chunk = 2048
+    for i in range(0, num_pages, chunk):
+        block = embeddings[i: i+chunk]   # memmap slice
+        # block assumed normalized on precompute; otherwise normalize here
+        dots = block.dot(q)
+        # update best
+        for j, score in enumerate(dots):
+            if score > best_scores.min():
+                pos = int(best_scores.argmin())
+                best_scores[pos] = float(score)
+                best_idxs[pos] = int(i + j)
+    order = np.argsort(-best_scores)
+    results = []
+    for pos in order:
+        idx = int(best_idxs[pos])
+        if idx == -1:
+            continue
+        results.append((idx, float(best_scores[pos])))
+    return results
 
-            if GEMINI_API_KEY:
-                self.client = genai.Client(api_key=GEMINI_API_KEY)
-            else:
-                # fallback to ADC (Application Default Credentials)
-                self.client = genai.Client()
+def generate_answer_with_context(question: str, context_snippets: List[str]):
+    # Combine snippets but cap total length to avoid giant prompts
+    context = "\n\n".join(context_snippets)[:8000]
+    prompt = f"""You are ScriptBees Assistant. Use ONLY the content provided to answer the question.
 
-        def generate(self, question, docs):
-            context = docs[0]["text"]
-            prompt = f"""You are ScriptBees AI Assistant.
-Answer ONLY using this ScriptBees content:
+Context:
 {context}
 
 Question: {question}
 
-Give a short and correct answer based ONLY on ScriptBees website."""
-            try:
-                # model selection: change MODEL_NAME if you prefer a different Gemini model
-                resp = self.client.models.generate_content(
-                    model=MODEL_NAME,
-                    contents=[prompt],
-                    max_output_tokens=MAX_TOKENS
-                )
-            except Exception as e:
-                msg = str(e)
-                logger.exception("Gemini (Google GenAI) request failed")
-                if "401" in msg or "unauthorized" in msg.lower():
-                    raise HTTPException(status_code=502, detail="Upstream Gemini authentication error")
-                if "429" in msg or "rate limit" in msg.lower():
-                    raise HTTPException(status_code=429, detail="Upstream Gemini rate limit")
-                raise HTTPException(status_code=502, detail=f"Upstream Gemini error: {msg}")
+Give a short, factual answer based ONLY on the context above."""
+    try:
+        resp = genai_client.models.generate_content(
+            model=GEN_MODEL,
+            contents=[prompt],
+            max_output_tokens=MAX_TOKENS,
+            temperature=TEMPERATURE
+        )
+        # robust extraction
+        text = getattr(resp, "text", None)
+        if not text:
+            # may be dict-like
+            candidates = getattr(resp, "candidates", None) or (resp.get("candidates") if isinstance(resp, dict) else None)
+            if candidates and len(candidates) > 0:
+                # some SDKs return 'content' inside candidate
+                text = candidates[0].get("content") if isinstance(candidates[0], dict) else getattr(candidates[0], "content", None)
+        if isinstance(text, dict):
+            text = text.get("text", "") or str(text)
+        if not text:
+            text = "No answer returned from upstream."
+    except Exception as e:
+        logger.exception("Gemini generation failed: %s", e)
+        raise HTTPException(status_code=502, detail="Upstream Gemini error")
+    return str(text).strip()
 
-            # Extract text
-            answer_text = ""
-            try:
-                # response typically has .text or choices; guard both ways
-                answer_text = getattr(resp, "text", None) or resp.get("candidates", [{}])[0].get("content", "")
-                if isinstance(answer_text, dict):
-                    # some responses may nest it
-                    answer_text = answer_text.get("text", "") or str(answer_text)
-                answer_text = str(answer_text).strip()
-            except Exception:
-                logger.exception("Failed to parse Gemini response")
-
-            if not answer_text:
-                answer_text = "No answer returned from upstream."
-            return answer_text
-
-    retriever = Retriever()
-    generator = LLMGenerator()
-    logger.info("✅ ScriptBees Assistant (Gemini) is READY")
-
-# middleware to log incoming path (helps debug double-slash issues)
-@app.middleware("http")
-async def log_path(request: Request, call_next):
-    logger.info("Incoming request: %s %s", request.method, request.url.path)
-    return await call_next(request)
-
-# API Route
+# Routes
 @app.post("/api/ask", response_model=AskResponse)
 async def ask(req: AskRequest, key: str = Depends(verify_api_key)):
     start = time.time()
-
-    # Check cache
     h = ckey(req.question)
     if h in cache:
         r = cache[h]
@@ -271,40 +228,45 @@ async def ask(req: AskRequest, key: str = Depends(verify_api_key)):
         r["response_time_seconds"] = time.time() - start
         return r
 
-    docs = retriever.retrieve(req.question)
-    if not docs:
-        return AskResponse(
-            answer="No matching information found on ScriptBees.",
-            sources=[],
-            retrieved=[],
-            cached=False,
-            response_time_seconds=time.time() - start
-        )
+    q_emb = get_embedding_for_text(req.question)
+    # ensure normalized
+    q_norm = np.linalg.norm(q_emb)
+    if q_norm > 0:
+        q_emb = q_emb / q_norm
 
-    answer = generator.generate(req.question, docs)
+    results = top_k_search(q_emb, k=TOP_K)
+    if not results:
+        return AskResponse(answer="No matching information found.", sources=[], retrieved=[], cached=False, response_time_seconds=time.time()-start)
 
-    first = docs[0]
-    source_obj = Source(url=first.get("url", ""), title=first.get("title", ""), score=first.get("score", 0.0))
+    # collect top snippets (may be multiple if TOP_K > 1)
+    snippets = []
+    retrieved_objs = []
+    for idx, score in results[:TOP_K]:
+        p = pages[idx]
+        snippets.append(p.get("snippet", "")[:2000])
+        retrieved_objs.append(Source(url=p.get("url",""), title=p.get("title",""), score=float(score)))
+
+    answer = generate_answer_with_context(req.question, snippets)
 
     resp = {
         "answer": answer,
-        "sources": [first.get("url", "")],
-        "retrieved": [source_obj],
+        "sources": [retrieved_objs[0].url] if retrieved_objs else [],
+        "retrieved": retrieved_objs,
         "cached": False,
         "response_time_seconds": time.time() - start
     }
-
     cache[h] = resp
     return resp
 
 @app.get("/")
-async def home():
-    return {"status": "online", "bot": "ScriptBees AI (Gemini)"}
+async def health():
+    return {"status": "online", "mode": "gemini-memmap"}
 
 @app.get("/favicon.ico")
 async def favicon():
     return Response(status_code=204)
 
+# local run
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", 8000)), reload=False)
