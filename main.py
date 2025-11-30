@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
-main.py - Robust memmap Gemini server for ScriptBees (REPAIR + tolerant mode)
+main.py - Robust memmap Gemini server for ScriptBees (CLEAN)
 
-Behavior improvements vs prior:
-- Attempts to auto-repair embeddings.npy if its byte size can be reshaped to (n_pages, dim).
-- If repair impossible, server starts with retriever disabled and /api/ask returns 503 with a message.
-- All original behavior otherwise preserved.
+Behavior:
+- Loads content/pages.json and content/embeddings.npy (memmap).
+- Attempts to auto-repair embeddings if the byte size can be reshaped to (n_pages, dim).
+- If repair impossible the retriever is disabled and /api/ask returns 503 with guidance.
+- Uses google-genai client via genai.Client().
 
-Requirements (same as before):
+Requirements:
 - google-genai
 - fastapi
 - uvicorn
@@ -25,7 +26,7 @@ import json
 import hashlib
 import logging
 from pathlib import Path
-from typing import List, Optional
+from typing import List
 
 import numpy as np
 from dotenv import load_dotenv
@@ -35,7 +36,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field
 
-# GenAI client
+# Try importing genai; keep None if unavailable (graceful degrade)
 try:
     from google import genai
 except Exception:
@@ -96,6 +97,7 @@ class AskResponse(BaseModel):
 
 # API Key security
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+
 def verify_api_key(req: Request, key: str = Depends(api_key_header)):
     incoming = key or ""
     if not incoming:
@@ -213,36 +215,116 @@ if genai is None:
     logger.warning("google-genai client not installed. Gemini features will fail if invoked.")
     genai_client = None
 else:
-    if GEMINI_API_KEY:
-        genai_client = genai.Client(api_key=GEMINI_API_KEY)
-    else:
-        genai_client = genai.Client()
+    try:
+        if GEMINI_API_KEY:
+            genai_client = genai.Client(api_key=GEMINI_API_KEY)
+        else:
+            genai_client = genai.Client()
+    except Exception as e:
+        logger.exception("Failed to create genai client: %s", e)
+        genai_client = None
 
-# Helper: embed question using Gemini
-def get_embedding_for_text(text: str):
+# Helper: embed question using Gemini (clean, robust)
+def get_embedding_for_text(text: str) -> np.ndarray:
+    """
+    Returns a normalized float32 numpy vector for the provided text.
+    Raises HTTPException(502) if embedding client is unavailable or the upstream response
+    shape is unexpected.
+    """
     if genai_client is None:
+        logger.error("Embedding client not available (genai_client is None)")
         raise HTTPException(status_code=502, detail="Embedding client not available")
-    resp = genai_client.embeddings.create(model=EMBED_MODEL, input=text)
-    if hasattr(resp, "data"):
-        vec = resp.data[0].embedding
-    else:
-        vec = resp.get("data", [])[0].get("embedding")
-    arr = np.array(vec, dtype=np.float32)
-    norm = np.linalg.norm(arr)
+
+    try:
+        # call embed_content with a single-item list (most SDKs accept list of contents)
+        resp = genai_client.models.embed_content(
+            model=EMBED_MODEL,
+            contents=[text]
+        )
+    except Exception as e:
+        logger.exception("Embedding request failed: %s", e)
+        raise HTTPException(status_code=502, detail="Upstream embedding error")
+
+    # Robustly extract the numeric embedding from several possible shapes
+    embedding = None
+
+    # 1) SDK object that exposes `embeddings` attribute
+    if hasattr(resp, "embeddings"):
+        try:
+            first = resp.embeddings[0]
+            # first might be a simple list/ndarray or an object with `.embedding`
+            if hasattr(first, "embedding"):
+                embedding = first.embedding
+            else:
+                embedding = first
+        except Exception:
+            embedding = None
+
+    # 2) Some SDK versions return a dict-like response with 'embeddings' or 'data'
+    if embedding is None and isinstance(resp, dict):
+        for key in ("embeddings", "data", "results"):
+            if key in resp and isinstance(resp[key], (list, tuple)) and len(resp[key]) > 0:
+                candidate = resp[key][0]
+                if isinstance(candidate, dict) and "embedding" in candidate:
+                    embedding = candidate["embedding"]
+                else:
+                    embedding = candidate
+                break
+
+    # 3) Some SDKs put useful info under `candidates` (generate-style responses)
+    if embedding is None and isinstance(resp, dict) and "candidates" in resp:
+        cand = resp["candidates"]
+        if isinstance(cand, (list, tuple)) and len(cand) > 0:
+            cand0 = cand[0]
+            if isinstance(cand0, dict) and "embedding" in cand0:
+                embedding = cand0["embedding"]
+
+    # 4) Fallback: try attributes commonly found on responses (for wrapped objects)
+    if embedding is None:
+        try:
+            data_attr = getattr(resp, "data", None)
+            if data_attr and len(data_attr) > 0:
+                item0 = data_attr[0]
+                if hasattr(item0, "embedding"):
+                    embedding = item0.embedding
+                elif isinstance(item0, dict) and "embedding" in item0:
+                    embedding = item0["embedding"]
+        except Exception:
+            pass
+
+    if embedding is None:
+        logger.error("Unable to parse embedding response. Response repr: %s", repr(resp))
+        raise HTTPException(status_code=502, detail="Unexpected embedding response structure from upstream")
+
+    # Convert to numpy array of float32
+    vec = np.asarray(embedding, dtype=np.float32).reshape(-1)
+
+    # If zero-length or too small, error
+    if vec.size == 0:
+        logger.error("Received empty embedding vector")
+        raise HTTPException(status_code=502, detail="Empty embedding returned by upstream")
+
+    # Normalize to unit length (cosine similarity)
+    norm = np.linalg.norm(vec)
     if norm > 0:
-        arr = arr / norm
-    return arr
+        vec = vec / norm
+
+    return vec
 
 # Simple top-k search against memmap embeddings
 def top_k_search(query_vec: np.ndarray, k: int = 1):
     if embeddings is None:
         return []
-    q = query_vec.reshape(-1)
+    q = query_vec.reshape(-1).astype(np.float32)
     best_scores = np.full(k, -np.inf, dtype=np.float32)
     best_idxs = np.full(k, -1, dtype=np.int32)
     chunk = 2048
     for i in range(0, num_pages, chunk):
         block = embeddings[i: i+chunk]
+        # ensure shapes align
+        if block.shape[1] != q.shape[0]:
+            logger.error("Embedding dim mismatch: block %s vs query %s", block.shape, q.shape)
+            break
         dots = block.dot(q)
         for j, score in enumerate(dots):
             if score > best_scores.min():
@@ -261,6 +343,7 @@ def top_k_search(query_vec: np.ndarray, k: int = 1):
 # Gemini generation using context snippets
 def generate_answer_with_context(question: str, context_snippets: List[str]):
     if genai_client is None:
+        logger.error("Generation client not available (genai_client is None)")
         raise HTTPException(status_code=502, detail="Generation client not available")
     context = "\n\n".join(context_snippets)[:8000]
     prompt = f"""You are ScriptBees Assistant. Use ONLY the content provided to answer the question.
@@ -278,13 +361,23 @@ Give a short, factual answer based ONLY on the context above."""
             max_output_tokens=MAX_TOKENS,
             temperature=TEMPERATURE
         )
-        text = getattr(resp, "text", None)
-        if not text:
-            candidates = getattr(resp, "candidates", None) or (resp.get("candidates") if isinstance(resp, dict) else None)
-            if candidates and len(candidates) > 0:
-                text = candidates[0].get("content") if isinstance(candidates[0], dict) else getattr(candidates[0], "content", None)
-        if isinstance(text, dict):
-            text = text.get("text", "") or str(text)
+        # Try to extract text from responses returned by different SDK variants
+        text = None
+        if hasattr(resp, "text") and resp.text:
+            text = resp.text
+        elif hasattr(resp, "candidates") and getattr(resp, "candidates"):
+            c = resp.candidates[0]
+            text = getattr(c, "content", None) or getattr(c, "text", None)
+        elif isinstance(resp, dict):
+            # dict-like response
+            if "candidates" in resp and isinstance(resp["candidates"], (list, tuple)) and len(resp["candidates"])>0:
+                cand0 = resp["candidates"][0]
+                if isinstance(cand0, dict) and "content" in cand0:
+                    text = cand0["content"]
+                elif isinstance(cand0, dict) and "text" in cand0:
+                    text = cand0["text"]
+            elif "text" in resp:
+                text = resp["text"]
         if not text:
             text = "No answer returned from upstream."
     except Exception as e:
@@ -297,7 +390,6 @@ Give a short, factual answer based ONLY on the context above."""
 async def ask(req: AskRequest, key: str = Depends(verify_api_key)):
     start = time.time()
     if not retriever_enabled:
-        # give a helpful error with guidance
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Retriever not available. Ensure content/pages.json and content/embeddings.npy exist and match. See logs."
