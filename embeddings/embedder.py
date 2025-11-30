@@ -1,35 +1,23 @@
 #!/usr/bin/env python3
 """
-embeddings/embedder.py
+embeddings/embedder.py - robust single-command generator for content pages + embeddings.
 
-One-command tool to produce the files your server needs:
-  - content/pages.json   (list of docs)
-  - content/embeddings.npy  (float32 matrix: rows == number of pages)
+Behavior:
+  1) FAST PATH: if `embeddings/embeddings.npy` AND `embeddings/docs.json` (or pages.json)
+     exist, convert/copy them into `out_dir/embeddings.npy` + `out_dir/pages.json` (validates counts).
+  2) SCAN PATH: scan raw directory (default: ./embeddings/content or ./content) and build pages
+     + embeddings using either local sentence-transformers or google-genai (Gemini).
+  3) Optionally build FAISS index with --build-faiss.
 
-Behavior (in order):
-  1) FAST PATH: if `embeddings/embeddings.npy` AND `embeddings/docs.json` exist,
-     convert/copy them into `content/embeddings.npy` + `content/pages.json` and exit.
-  2) SCAN PATH: scan a directory of raw files (default: ./embeddings/content or ./content),
-     build pages list, then:
-       a) prefer local sentence-transformers (offline) if installed
-       b) else use google-genai (Gemini) if installed and GEMINI_API_KEY set
-  3) Save outputs to ./content and optionally build FAISS index if --build-faiss.
-
-Usage (from project root):
-  python .\embeddings\embedder.py                # default behavior (fast-path first)
-  python .\embeddings\embedder.py --force       # overwrite existing content/* outputs
-  python .\embeddings\embedder.py --build-faiss # also create content/pages.faiss
-
-Notes:
- - The script is defensive and prints helpful errors.
- - For local use it's best to have sentence-transformers installed (pip install sentence-transformers faiss-cpu).
+Usage (single-line, Windows-friendly):
+  python .\embeddings\embedder.py --out-dir .\content --build-faiss --force
 """
 import os
 import json
 import argparse
 import shutil
 from pathlib import Path
-from typing import List, Optional
+from typing import List
 
 import numpy as np
 from bs4 import BeautifulSoup
@@ -77,7 +65,7 @@ def gather_documents(content_dir: Path) -> List[dict]:
     if not content_dir.exists():
         return docs
     for p in sorted(content_dir.rglob("*")):
-        if not p.is_file(): 
+        if not p.is_file():
             continue
         if p.suffix.lower() not in SUPPORTED_EXTS:
             continue
@@ -95,21 +83,34 @@ def gather_documents(content_dir: Path) -> List[dict]:
     return docs
 
 
-def try_fastpath_copy(src_dir: Path, out_dir: Path) -> bool:
+def try_fastpath_copy(src_dir: Path, out_dir: Path, force: bool = False) -> bool:
     """
-    If embeddings/embeddings.npy and embeddings/docs.json exist, copy/convert them into out_dir.
-    Returns True if copied successfully.
+    Accept either:
+      - embeddings/embeddings.npy + embeddings/docs.json
+      - embeddings/embeddings.npy + embeddings/pages.json
+    Validate row counts (embeddings rows == number of pages).
+    If mismatch and not force -> return False and print helpful message.
     """
     src_emb = src_dir / "embeddings.npy"
-    src_docs = src_dir / "docs.json"
-    if not (src_emb.exists() and src_docs.exists()):
+    src_docs1 = src_dir / "docs.json"
+    src_docs2 = src_dir / "pages.json"
+    docs_file = None
+    if not src_emb.exists():
         return False
-    print("Fast-path: detected precomputed embeddings/docs in", src_dir)
+    if src_docs1.exists():
+        docs_file = src_docs1
+    elif src_docs2.exists():
+        docs_file = src_docs2
+    else:
+        # no docs file to map to embedding rows
+        return False
+
+    print(f"Fast-path: detected precomputed embeddings in {src_dir} and docs at {docs_file.name}")
     try:
-        with open(src_docs, "r", encoding="utf-8") as f:
+        with open(docs_file, "r", encoding="utf-8") as f:
             docs_raw = json.load(f)
     except Exception as e:
-        print("Failed to read docs.json:", e)
+        print("Failed to read docs file:", e)
         return False
 
     try:
@@ -118,13 +119,29 @@ def try_fastpath_copy(src_dir: Path, out_dir: Path) -> bool:
         print("Failed to load embeddings.npy:", e)
         return False
 
+    num_rows = int(arr.shape[0]) if arr.ndim >= 2 else None
+    num_docs = len(docs_raw)
+    if num_rows is None:
+        print("Embeddings file shape is unexpected:", arr.shape)
+        if not force:
+            print("Use --force to overwrite outputs instead of fast-path.")
+            return False
+    else:
+        if num_rows != num_docs:
+            msg = f"Embeddings rows ({num_rows}) != docs count ({num_docs})."
+            if not force:
+                print(msg, "Fast-path aborted. Use --force to overwrite outputs or regenerate embeddings.")
+                return False
+            else:
+                print(msg, "But --force given: fast-path will proceed to copy (be careful).")
+
     # convert docs_raw to pages.json format (robust)
     pages = []
     for i, d in enumerate(docs_raw):
-        title = d.get("title") or d.get("name") or Path(d.get("path","")).stem
+        title = d.get("title") or d.get("name") or Path(d.get("path", "")).stem
         path = d.get("path", f"doc_{i}")
         snippet = d.get("snippet") or (d.get("text")[:2000] if d.get("text") else "")
-        pages.append({"id": str(i), "path": path, "title": title, "url": d.get("url",""), "snippet": snippet})
+        pages.append({"id": str(i), "path": path, "title": title, "url": d.get("url", ""), "snippet": snippet})
 
     out_dir.mkdir(parents=True, exist_ok=True)
     try:
@@ -158,9 +175,8 @@ def embed_with_genai(model_name: str, texts: List[str], batch_size: int = 16) ->
     client = genai.Client(api_key=key) if key else genai.Client()
     out = []
     for i in range(0, len(texts), batch_size):
-        batch = texts[i:i+batch_size]
+        batch = texts[i:i + batch_size]
         resp = client.embeddings.create(model=model_name, input=batch)
-        # handle response shapes
         if hasattr(resp, "data"):
             for item in resp.data:
                 vec = getattr(item, "embedding", None) or item.get("embedding")
@@ -168,7 +184,7 @@ def embed_with_genai(model_name: str, texts: List[str], batch_size: int = 16) ->
         else:
             for item in resp.get("data", []):
                 out.append(item.get("embedding"))
-        print(f"Computed embeddings {min(i+batch_size, len(texts))}/{len(texts)}")
+        print(f"Computed embeddings {min(i + batch_size, len(texts))}/{len(texts)}")
     arr = np.asarray(out, dtype=np.float32)
     # normalize
     norms = np.linalg.norm(arr, axis=1, keepdims=True)
@@ -198,64 +214,63 @@ def main():
     p.add_argument("--model", type=str, default="all-MiniLM-L6-v2", help="Local embed model (sentence-transformers) or genai model name")
     p.add_argument("--use-genai", action="store_true", help="Force using google-genai for embeddings")
     p.add_argument("--build-faiss", action="store_true", help="Also build FAISS index (optional)")
-    p.add_argument("--force", action="store_true", help="Overwrite outputs if exist")
+    p.add_argument("--force", action="store_true", help="Overwrite outputs if exist / override fast-path checks")
     args = p.parse_args()
 
     out_dir = Path(args.out_dir)
     raw_dir = Path(args.raw_dir)
     content_dir = Path(args.content_dir)
 
-    # 1) FAST PATH: copy existing embeddings/docs.json if present
+    # 1) FAST PATH: try copying precomputed embeddings/docs from 'embeddings'
     fast_src = Path("embeddings")
-    if try_fastpath_copy(fast_src, out_dir):
+    if try_fastpath_copy(fast_src, out_dir, force=args.force):
         print("Fast-path complete. Done.")
         return
 
-    # 2) Determine where raw files live (prefer embeddings/content, then content/)
+    # 2) Decide where to scan raw content
     scan_dir = raw_dir if raw_dir.exists() and any(raw_dir.rglob("*")) else content_dir
     if not scan_dir.exists():
-        raise SystemExit(f"No raw content found in {raw_dir} or {content_dir}. Put your text/html files there or use fast-path artifacts.")
+        raise SystemExit(f"No raw content found in {raw_dir} or {content_dir}. Put your files there or use artifacts in embeddings/")
 
     print("Scanning raw content in:", scan_dir)
     docs = gather_documents(scan_dir)
     if not docs:
         raise SystemExit("No documents found in content dir. Put .txt/.md/.html files in the folder.")
 
-    texts = [(d.get("title","") + "\n" + d.get("text",""))[:8000] for d in docs]
+    texts = [(d.get("title", "") + "\n" + d.get("text", ""))[:8000] for d in docs]
 
-    # If outputs exist and not forced, abort to avoid accidental overwrite
+    # avoid accidental overwrite
     emb_path = out_dir / "embeddings.npy"
     pages_path = out_dir / "pages.json"
     if (emb_path.exists() or pages_path.exists()) and not args.force:
         print(f"Output {emb_path} or {pages_path} already exists. Use --force to overwrite.")
         return
 
-    # Choose embedding backend
+    # choose backend and embed
     embeddings = None
     if args.use_genai:
         if not HAS_GENAI:
             raise SystemExit("google-genai not installed; cannot use --use-genai")
-        print("Using google-genai for embeddings (make sure GEMINI_API_KEY is set).")
+        print("Using google-genai for embeddings (ensure GEMINI_API_KEY set).")
         embeddings = embed_with_genai(args.model, texts)
     else:
-        # prefer local sentence-transformers if available
         if HAS_S2:
             print("Using local sentence-transformers model:", args.model)
             embeddings = embed_with_sentence_transformers(args.model, texts)
         elif HAS_GENAI:
-            print("sentence-transformers not found; falling back to google-genai embeddings.")
+            print("sentence-transformers not found; falling back to google-genai.")
             embeddings = embed_with_genai(args.model, texts)
         else:
-            raise SystemExit("No embedding backend available. Install sentence-transformers for local embeddings or set up google-genai + GEMINI_API_KEY.")
+            raise SystemExit("No embedding backend available. Install sentence-transformers or configure google-genai+GEMINI_API_KEY.")
 
-    # Save outputs
     out_dir.mkdir(parents=True, exist_ok=True)
     np.save(out_dir / "embeddings.npy", embeddings.astype(np.float32))
-    pages_out = [{"id": d["id"], "path": d["path"], "title": d["title"], "url": d.get("url",""), "snippet": d.get("snippet","")[:2000]} for d in docs]
+    pages_out = [{"id": d["id"], "path": d["path"], "title": d["title"], "url": d.get("url", ""), "snippet": d.get("snippet", "")[:2000]} for d in docs]
     with open(out_dir / "pages.json", "w", encoding="utf-8") as f:
         json.dump(pages_out, f, ensure_ascii=False, indent=2)
     print("Wrote:", out_dir / "embeddings.npy", "and", out_dir / "pages.json")
 
+    # optional FAISS
     if args.build_faiss:
         try:
             build_faiss(embeddings, out_dir)
@@ -266,7 +281,7 @@ def main():
         except Exception as e:
             print("FAISS build failed:", e)
 
-    print("Done — content generated. Now run your server (uvicorn main:app ...).")
+    print("Done — content generated. Now run your server (uvicorn main:app --host 0.0.0.0 --port $PORT).")
 
 
 if __name__ == "__main__":
