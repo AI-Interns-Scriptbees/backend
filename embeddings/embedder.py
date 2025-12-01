@@ -5,8 +5,8 @@ embeddings/embedder.py - robust single-command generator for content pages + emb
 Behavior:
   1) FAST PATH: if `embeddings/embeddings.npy` AND `embeddings/docs.json` (or pages.json)
      exist, convert/copy them into `out_dir/embeddings.npy` + `out_dir/pages.json` (validates counts).
-  2) SCAN PATH: scan raw directory (default: ./embeddings/content or ./content) and build pages
-     + embeddings using either local sentence-transformers or google-genai (Gemini).
+  2) Otherwise scan `content` (or provided raw dir), embed pages using either local
+     sentence-transformers or google-genai (Genie/Gemini via google-genai) and write outputs.
   3) Optionally build FAISS index with --build-faiss.
 
 Usage (single-line, Windows-friendly):
@@ -17,7 +17,7 @@ import json
 import argparse
 import shutil
 from pathlib import Path
-from typing import List
+from typing import List, Any
 
 import numpy as np
 from bs4 import BeautifulSoup
@@ -159,7 +159,7 @@ def embed_with_sentence_transformers(model_name: str, texts: List[str], batch_si
     if not HAS_S2:
         raise RuntimeError("sentence-transformers not installed")
     model = SentenceTransformer(model_name)
-    embs = model.encode(texts, show_progress_bar=True, convert_to_numpy=True)
+    embs = model.encode(texts, show_progress_bar=True, convert_to_numpy=True, batch_size=batch_size)
     embs = np.asarray(embs, dtype=np.float32)
     # normalize rows
     norms = np.linalg.norm(embs, axis=1, keepdims=True)
@@ -168,23 +168,160 @@ def embed_with_sentence_transformers(model_name: str, texts: List[str], batch_si
     return embs
 
 
+def _extract_numeric_from_genai_resp(item: Any) -> List[float]:
+    """
+    Aggressive extractor for numeric embedding from various google-genai SDK shapes.
+    Returns a flat list of floats or raises RuntimeError with a helpful repr.
+    """
+    import re
+
+    # 1) None
+    if item is None:
+        raise RuntimeError("Empty item")
+
+    # 2) dict-like: common keys
+    if isinstance(item, dict):
+        for key in ("embedding", "embedding_vector", "values", "value", "vector", "data"):
+            if key in item and item[key] is not None:
+                cand = item[key]
+                if hasattr(cand, "__iter__") and not isinstance(cand, (str, bytes)):
+                    return [float(x) for x in list(cand)]
+        # nested lists under known keys
+        for key in ("data", "results", "candidates"):
+            if key in item and isinstance(item[key], (list, tuple)) and len(item[key]) > 0:
+                return _extract_numeric_from_genai_resp(item[key][0])
+
+    # 3) wrapper objects with .embedding
+    try:
+        if hasattr(item, "embedding"):
+            val = getattr(item, "embedding")
+            # val might be list-like or another wrapper
+            if val is None:
+                pass
+            elif hasattr(val, "__iter__") and not isinstance(val, (str, bytes)):
+                return [float(x) for x in list(val)]
+            else:
+                return _extract_numeric_from_genai_resp(val)
+    except Exception:
+        pass
+
+    # 4) wrapper objects with .data (some SDKs)
+    try:
+        if hasattr(item, "data") and item.data:
+            first = item.data[0]
+            if hasattr(first, "embedding"):
+                emb = getattr(first, "embedding")
+                if hasattr(emb, "__iter__"):
+                    return [float(x) for x in list(emb)]
+            if isinstance(first, dict) and "embedding" in first:
+                return [float(x) for x in first["embedding"]]
+            return _extract_numeric_from_genai_resp(first)
+    except Exception:
+        pass
+
+    # 5) plain list/tuple/ndarray
+    if isinstance(item, (list, tuple, np.ndarray)):
+        flat = []
+        for el in item:
+            if isinstance(el, (list, tuple, np.ndarray)):
+                flat.extend([float(x) for x in list(el)])
+            else:
+                try:
+                    flat.append(float(el))
+                except Exception:
+                    sub = None
+                    try:
+                        sub = _extract_numeric_from_genai_resp(el)
+                    except Exception:
+                        sub = None
+                    if sub is None:
+                        raise RuntimeError("Cannot convert nested element to float")
+                    flat.extend(sub)
+        if flat:
+            return flat
+
+    # 6) try .tolist(), .to_list(), .numpy()
+    try:
+        if hasattr(item, "tolist"):
+            arr = item.tolist()
+            if hasattr(arr, "__iter__"):
+                return [float(x) for x in list(arr)]
+    except Exception:
+        pass
+    try:
+        if hasattr(item, "to_list"):
+            arr = item.to_list()
+            if hasattr(arr, "__iter__"):
+                return [float(x) for x in list(arr)]
+    except Exception:
+        pass
+    try:
+        if hasattr(item, "numpy"):
+            arr = item.numpy()
+            if hasattr(arr, "__iter__"):
+                return [float(x) for x in list(arr)]
+    except Exception:
+        pass
+
+    # 7) last-resort: scan repr for long numeric list
+    try:
+        r = repr(item)
+        m = re.search(r"\[[-0-9eE\.,\s]{50,}\]", r)
+        if m:
+            nums = [float(x) for x in re.findall(r"[-+]?\d*\.\d+|[-+]?\d+", m.group(0))]
+            if nums:
+                return nums
+    except Exception:
+        pass
+
+    # failed
+    raise RuntimeError("Unable to extract numeric embedding from GenAI response item. repr(item)[:400]=" + repr(item)[:400])
+
+
 def embed_with_genai(model_name: str, texts: List[str], batch_size: int = 16) -> np.ndarray:
+    """
+    Use google-genai's modern SDK shape `models.embed_content(...)` when available.
+    Returns normalized float32 array (N, D).
+    """
     if not HAS_GENAI:
         raise RuntimeError("google-genai not installed")
+
     key = os.getenv("GEMINI_API_KEY")
     client = genai.Client(api_key=key) if key else genai.Client()
     out = []
     for i in range(0, len(texts), batch_size):
         batch = texts[i:i + batch_size]
-        resp = client.embeddings.create(model=model_name, input=batch)
-        if hasattr(resp, "data"):
-            for item in resp.data:
-                vec = getattr(item, "embedding", None) or item.get("embedding")
-                out.append(vec)
+        # prefer models.embed_content
+        try:
+            resp = client.models.embed_content(model=model_name, contents=batch)
+        except Exception as e:
+            # some older SDKs might use client.embeddings.create(...)
+            try:
+                resp = client.embeddings.create(model=model_name, input=batch)
+            except Exception as e2:
+                raise RuntimeError(f"Embed API call failed for batch starting at {i}: {e}; fallback also failed: {e2}")
+
+        # unify plausible shapes
+        results = None
+        if hasattr(resp, "embeddings"):
+            results = resp.embeddings
+        elif isinstance(resp, dict) and "embeddings" in resp:
+            results = resp["embeddings"]
+        elif isinstance(resp, dict) and "data" in resp:
+            results = resp["data"]
+        elif hasattr(resp, "data"):
+            results = resp.data
+        elif isinstance(resp, (list, tuple)):
+            results = resp
         else:
-            for item in resp.get("data", []):
-                out.append(item.get("embedding"))
+            results = [resp]
+
+        # extract each
+        for item in results:
+            vec = _extract_numeric_from_genai_resp(item)
+            out.append(vec)
         print(f"Computed embeddings {min(i + batch_size, len(texts))}/{len(texts)}")
+
     arr = np.asarray(out, dtype=np.float32)
     # normalize
     norms = np.linalg.norm(arr, axis=1, keepdims=True)
