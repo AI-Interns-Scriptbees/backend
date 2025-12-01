@@ -6,7 +6,7 @@ This file:
 - Uses genai_client.models.embed_content(...) (robust across SDKs)
 - Extracts numeric embeddings from SDK wrapper objects (ContentEmbedding etc.)
 - Auto-discovers a working embedding model at startup if EMBED_MODEL fails
-- Loads/repairs content/pages.json and content/embeddings.npy (memmap)
+- Loads/repairs content/pages.json and content/embeddings (prefers .memmap)
 - Provides / endpoint showing selected embed model
 """
 
@@ -60,7 +60,10 @@ TEMPERATURE = float(os.getenv("TEMPERATURE", "0.2"))
 
 CONTENT_DIR = Path("content")
 PAGES_FILE = CONTENT_DIR / "pages.json"
-EMBED_FILE = CONTENT_DIR / "embeddings.npy"
+EMBED_FILE = CONTENT_DIR / "embeddings.npy"         # legacy / .npy file
+MEMMAP_FILE = CONTENT_DIR / "embeddings.memmap"     # preferred raw memmap
+BIN_FILE = CONTENT_DIR / "embeddings.bin"           # optional raw bin
+EMBED_META = CONTENT_DIR / "embeddings_info.json"   # optional metadata file
 
 # -------- Logging --------
 logging.basicConfig(level=logging.INFO)
@@ -115,7 +118,7 @@ cache = {}
 
 # -------- Globals for retriever --------
 pages: List[dict] = []
-embeddings: Optional[np.memmap] = None   # numpy memmap or ndarray
+embeddings: Optional[np.ndarray] = None   # numpy memmap or ndarray
 emb_dim = 0
 num_pages = 0
 retriever_enabled = False
@@ -137,67 +140,130 @@ def load_pages() -> bool:
         return False
 
 def try_load_or_repair_embeddings() -> bool:
-    global embeddings, emb_dim, retriever_enabled
-    if not EMBED_FILE.exists():
-        logger.error("Missing embeddings.npy at %s", EMBED_FILE)
+    """
+    Prefer loading content/embeddings.memmap (raw float32). If not present:
+      - try to load content/embeddings.npy via np.load (handles real .npy)
+      - if .npy was stored as raw floats (no header) the previous memmap approach will also work
+      - fallback to content/embeddings.bin (raw floats)
+    This function validates shapes against num_pages and optional embeddings_info.json.
+    """
+    global embeddings, emb_dim, retriever_enabled, num_pages
+
+    # require pages loaded first
+    if num_pages <= 0:
+        logger.error("num_pages is zero; cannot load embeddings")
         return False
 
-    try:
-        size_bytes = EMBED_FILE.stat().st_size
-        if size_bytes % 4 != 0:
-            logger.error("Embeddings file size (%d) not divisible by 4 -> not float32", size_bytes)
-            return False
-        total_floats = size_bytes // 4
-        if num_pages <= 0:
-            logger.error("num_pages is zero; cannot shape embeddings")
-            return False
-        if total_floats % num_pages != 0:
-            logger.error("Total floats (%d) not divisible by num_pages (%d) -> cannot reshape", total_floats, num_pages)
-            return False
-
-        dim = total_floats // num_pages
-        logger.info("Inferred embeddings shape: (%d, %d)", num_pages, dim)
-
-        # Try memmap load
+    # optional metadata
+    expected_dim = None
+    expected_count = None
+    if EMBED_META.exists():
         try:
-            mm = np.memmap(str(EMBED_FILE), dtype=np.float32, mode="r", shape=(num_pages, dim))
-            # quick sanity
-            sample = mm[0]
-            if np.isnan(sample).any():
-                logger.warning("Embeddings contain NaNs in sample row.")
-            embeddings = mm
+            meta = json.load(open(EMBED_META, "r"))
+            expected_dim = int(meta.get("dim")) if meta.get("dim") is not None else None
+            expected_count = int(meta.get("count")) if meta.get("count") is not None else None
+            logger.info("Found embeddings_info.json: %s", meta)
+            if expected_count is not None and expected_count != num_pages:
+                logger.warning("embeddings_info.json.count (%d) != pages.json count (%d). Continuing but double-check.", expected_count, num_pages)
+        except Exception as e:
+            logger.warning("Failed to read embeddings_info.json: %s", e)
+
+    # 1) Prefer memmap (raw float32 file)
+    if MEMMAP_FILE.exists():
+        try:
+            m = np.memmap(str(MEMMAP_FILE), dtype=np.float32, mode="r")
+            total_floats = m.size
+            if total_floats % num_pages != 0:
+                logger.error("Memmap total floats (%d) not divisible by num_pages (%d) -> cannot reshape", total_floats, num_pages)
+                return False
+            dim = total_floats // num_pages
+            if expected_dim is not None and dim != expected_dim:
+                logger.warning("Memmap inferred dim %d != embeddings_info.json dim %d", dim, expected_dim)
+            # reshape memmap-backed view
+            embeddings = m.reshape((num_pages, dim))
             emb_dim = dim
             retriever_enabled = True
-            logger.info("Loaded embeddings memmap with shape (%d,%d)", num_pages, emb_dim)
+            logger.info("Loaded embeddings.memmap with shape (%d,%d)", num_pages, emb_dim)
             return True
         except Exception as e:
-            logger.warning("Memmap load failed for shape (%d,%d): %s", num_pages, dim, e)
-            # fallback: load and reshape
-            try:
-                arr = np.load(str(EMBED_FILE), mmap_mode="r")
-                arr = np.asarray(arr, dtype=np.float32)
-                if arr.ndim == 1:
-                    arr = arr.reshape((num_pages, dim))
-                elif arr.ndim == 2 and arr.shape[0] == num_pages and arr.shape[1] == dim:
-                    pass
-                else:
-                    logger.warning("Loaded array shape %s not matching expected (%d,%d)", arr.shape, num_pages, dim)
+            logger.exception("Failed to load embeddings.memmap: %s", e)
+            # continue to fallbacks
+
+    # 2) Try .npy (real numpy .npy file)
+    if EMBED_FILE.exists():
+        try:
+            # Try to load using numpy (safe for .npy)
+            arr = np.load(str(EMBED_FILE), mmap_mode="r")
+            arr = np.asarray(arr, dtype=np.float32)
+            # If arr is 1-D but total floats divisible, reshape
+            if arr.ndim == 1:
+                total_floats = arr.size
+                if total_floats % num_pages != 0:
+                    logger.error("Loaded .npy has total floats (%d) not divisible by num_pages (%d) -> cannot reshape", total_floats, num_pages)
                     return False
+                dim = total_floats // num_pages
+                arr = arr.reshape((num_pages, dim))
+            elif arr.ndim == 2:
+                dim = arr.shape[1]
+                if arr.shape[0] != num_pages:
+                    logger.warning("Loaded .npy rows (%d) != pages count (%d).", arr.shape[0], num_pages)
+            else:
+                logger.error("Loaded .npy has unexpected ndim: %s", arr.shape)
+                return False
+
+            if expected_dim is not None and dim != expected_dim:
+                logger.warning("Loaded .npy dim %d != embeddings_info.json dim %d", dim, expected_dim)
+
+            # Optionally repair: write memmap-friendly version if necessary
+            try:
+                # Save to a repaired .npy and then memmap it (atomic replace)
                 repaired = str(EMBED_FILE.parent / "embeddings_repaired.npy")
                 np.save(repaired, arr.astype(np.float32))
                 os.replace(repaired, str(EMBED_FILE))
-                mm2 = np.memmap(str(EMBED_FILE), dtype=np.float32, mode="r", shape=(num_pages, dim))
+                mm2 = np.memmap(str(EMBED_FILE), dtype=np.float32, mode="r", shape=(arr.shape[0], arr.shape[1]))
                 embeddings = mm2
-                emb_dim = dim
+                emb_dim = arr.shape[1]
                 retriever_enabled = True
-                logger.info("Repaired and loaded embeddings memmap (%d,%d)", num_pages, emb_dim)
+                logger.info("Loaded and memmaped embeddings.npy shape (%d,%d)", arr.shape[0], arr.shape[1])
                 return True
-            except Exception as e2:
-                logger.exception("Failed fallback reshape & load: %s", e2)
+            except Exception as e_inner:
+                # If we cannot atomically replace, just keep numpy array
+                embeddings = arr
+                emb_dim = arr.shape[1]
+                retriever_enabled = True
+                logger.info("Loaded embeddings.npy into memory shape (%d,%d)", arr.shape[0], arr.shape[1])
+                return True
+
+        except Exception as e:
+            logger.exception("Failed to load embeddings.npy via np.load: %s", e)
+            # continue to fallback
+
+    # 3) Try raw binary .bin (float32)
+    if BIN_FILE.exists():
+        try:
+            size_bytes = BIN_FILE.stat().st_size
+            if size_bytes % 4 != 0:
+                logger.error("embeddings.bin size (%d) not divisible by 4", size_bytes)
                 return False
-    except Exception as outer_e:
-        logger.exception("Unexpected error when loading embeddings: %s", outer_e)
-        return False
+            total_floats = size_bytes // 4
+            if total_floats % num_pages != 0:
+                logger.error("embeddings.bin total floats (%d) not divisible by num_pages (%d)", total_floats, num_pages)
+                return False
+            dim = total_floats // num_pages
+            if expected_dim is not None and dim != expected_dim:
+                logger.warning("embeddings.bin inferred dim %d != embeddings_info.json dim %d", dim, expected_dim)
+            m = np.memmap(str(BIN_FILE), dtype=np.float32, mode="r")
+            embeddings = m.reshape((num_pages, dim))
+            emb_dim = dim
+            retriever_enabled = True
+            logger.info("Loaded embeddings.bin with shape (%d,%d)", num_pages, emb_dim)
+            return True
+        except Exception as e:
+            logger.exception("Failed to load embeddings.bin: %s", e)
+            return False
+
+    logger.error("No embeddings file found in content/ (looked for .memmap, .npy, .bin)")
+    return False
 
 # Startup: load pages + embeddings
 logger.info("Starting ScriptBees memmap server (robust startup)...")
@@ -584,7 +650,7 @@ async def ask(req: AskRequest, key: str = Depends(verify_api_key)):
     if not retriever_enabled:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Retriever not available. Ensure content/pages.json and content/embeddings.npy exist and match. See logs."
+            detail="Retriever not available. Ensure content/pages.json and content/embeddings exist and match. See logs."
         )
 
     h = ckey(req.question)
